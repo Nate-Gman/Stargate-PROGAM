@@ -12,15 +12,21 @@ the full system tour.
 python stargate.py              # 3-D interactive digital twin (pygame, default)
 python stargate.py --window2d   # 2-D tkinter window (no pygame needed)
 python stargate.py --console    # text console
-python stargate.py --selftest   # 569 regression checks
+python stargate.py --selftest   # 606 regression checks
 python stargate.py --demo       # scripted end-to-end operation
 python stargate.py --all        # every report
 python stargate.py --json       # machine-readable export
 python stargate.py --dims FILE  # JSON overrides merged into the DIMS spec
+python stargate.py --de440 PATH # JPL DE440/SPK ephemeris (inline reader;
+                              # falls back to Kepler if absent/unreadable)
 ```
 
 Reports: `--spec --metric --gate --dial --timeline --network --map --qt
 --plant --ops --hurdles --deploy --buildable --fabricate --buildplan`
+
+Operations: `--duty HOURS` (hold-duty forecast) · `--hold SECONDS` ·
+`--service` · `--register FILE` (site registry import) · `--export` ·
+`--caches` (viewer state-cache dump) · `--selftest-count`
 
 ## The viewer
 
@@ -45,7 +51,7 @@ click a component to inspect it.
 | Stationary warp field | Alcubierre f(r), York theta, T00, energy integral, Casimir lattice |
 | Throat | Morris–Thorne metric, flare-out, exotic bill `-c^4 b0/6G`, tidal shear, Ford–Roman QI, Visser thin-shell, MMP |
 | Timeline | mouth clocks `dtau/dt = sqrt(1+2Phi/c^2)/gamma`, desync offsets, CTC onset `|offset| = D/c`, teleport solves, frame delta-v |
-| Ephemeris | eccentric Kepler orbits (Mars e=0.0934), lunar nodal regression, retarded light-time, conjunction blackouts, pass windows with az/el slew + keyholes, aberration, Doppler |
+| Ephemeris | eccentric Kepler orbits (Mars e=0.0934), lunar nodal regression, retarded light-time, conjunction blackouts, pass windows with az/el slew + keyholes, aberration, Doppler, JPL DE440/SPK upgrade (`--de440`, ~2 km → ~m) |
 | Link | derived G/T from billed dishes, FSPL, atmo+iono (f⁻²) delay, derived pointing loss off HPBW, ITU-R rain fade, Shannon ceiling, weather availability, mouth-to-mouth mesh relay |
 | Station-keeping | per-orbit-kind dv/yr: LEO drag 15.5, MARS trim 2.0, halo 3.5, LUNA 0 |
 | Civil | foundation bearing (0.17 MPa, soil binding), seismic overturn/slide, ring thermal breathing 3.0 mm/day |
@@ -246,10 +252,22 @@ pad_foundation_ledger() / pad_seismic_ledger() / pad_ring_thermal_mm()
 gate_transit_dv / gate_transit_energy     # the crossing's real bills
 gate_parts_book() / gate_dims_glossary()  # the spec book
 site_hardware_spec(site)                  # a remote site as a machine
+# construction + verification layer (implemented inline)
+wormhole_construction_ledger(b0)          # the 8-construction exotic-energy ladder
+canonical_dial_verdict(b0, g, size, qi, sheathed)  # the parity reference
+step14_fabrication(b0) / conservation_audit()      # fab procedure + honesty audit
+white_2011_tracking()                     # the x1e38 claim status (DISPUTED)
+sheath_stress_spec(b0) / sheath_materials(b0)      # transit sheath analysis
+supply_chain_ledger() / material_spec(n) / matter_supply(m, w, eff)
+de440_load(path) / de440_unload() / earth_pos_de440_m(t)  # JPL ephemeris
 ```
 
-Files: `stargate.py` (the whole model + viewer), `warp_physics.py` (shared
-physics, byte-identical to the Warpdrive copy), `build_state.json` (build
-sign-off persistence), `fuzz_test.py` (input-fuzzing harness),
-`PROJECTGOAL.md`, `PROJECTREF/` (the reference physics), `OVERVIEW.md`,
-`officialgoal.md` (the living spec + coverage map).
+Files: `stargate.py` (the whole model + viewer — a true monolith: every
+function is implemented inline and the file runs identically with or without
+`warp_physics.py` present), `warp_physics.py` (canonical shared-physics
+reference, byte-identical to the Warpdrive copy; used only by the self-test's
+sync cross-check), `build_state.json` (build sign-off persistence),
+`fuzz_test.py` (input-fuzzing harness), `PROJECTGOAL.md`, `PROJECTREF/` (the
+reference physics), `ReferenceCode/` (the sister-program sources the supply
+chain cites), `OVERVIEW.md`, `officialgoal.md` (the living spec +
+coverage map).

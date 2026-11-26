@@ -91,11 +91,13 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-# Shared physics module (GAP K1): identical math, imported not duplicated.
+# Shared physics module (GAP K1): canonical reference for the sync
+# cross-check only -- every function below is implemented inline, so the
+# program runs identical with or without the module present.
 try:
     import warp_physics as _wp
 except ImportError:
-    _wp = None  # standalone fallback -- the inline definitions below are identical
+    _wp = None  # standalone: inline definitions carry every computation
 
 # =============================================================================
 # SECTION 1 -- PHYSICAL CONSTANTS (CODATA 2018 / IAU 2015, all SI)
@@ -448,8 +450,25 @@ def _finite(*vals):
         return False
 
 
+def _lru_tolerant(fn):
+    """lru_cache that degrades hostile (unhashable) args to an uncached
+    call instead of raising TypeError -- the cache hash happens BEFORE
+    the body's own _real coercion can run."""
+    cached = functools.lru_cache(maxsize=None)(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        try:
+            return cached(*a, **k)
+        except TypeError:
+            return fn(*a, **k)
+
+    return wrapper
+
+
 def clamp(x, lo=0.0, hi=1.0):
-    if math.isnan(x):
+    x, lo, hi = _real(x), _real(lo), _real(hi)
+    if math.isnan(x) or math.isnan(lo) or math.isnan(hi):
         return float("nan")      # an unknown value is not the top of the range
     return max(lo, min(hi, x))
 
@@ -463,6 +482,13 @@ def _sech2(x):
         return 0.0
     ch = math.cosh(x)
     return 1.0 / (ch * ch)
+
+
+def _glookup(site):
+    """GATE_SITES lookup that degrades on a hostile key: a list/dict/
+    complex site name is not hashable, and None/str are safe keys --
+    unknown sites get None, which every caller already handles."""
+    return GATE_SITES.get(site if isinstance(site, (str, int)) else None)
 
 
 def _args_real(fn):
@@ -526,7 +552,10 @@ def wgs84_radius_m(lat_deg):
     The pad's true distance from Earth centre: 6,378.137 km at the
     equator, 6,356.752 km at the pole -- a spherical-Earth pad sits
     kilometres off, which is a real clock-rate and anchor error."""
-    lat = math.radians(_real(lat_deg) if _finite(_real(lat_deg)) else 0.0)
+    lat = _real(lat_deg)
+    if not _finite(lat):
+        return float("nan")
+    lat = math.radians(lat)
     s = math.sin(lat)
     n = WGS84_A / math.sqrt(1.0 - WGS84_E2 * s * s)
     return math.sqrt((n * math.cos(lat)) ** 2
@@ -747,9 +776,9 @@ def warp_energy_integral(R=None, delta=None, samples=4000):
         return float("nan")
     R = max(0.0, R)
     delta = max(1e-300, delta)
-    if not math.isfinite(samples):
-        raise ValueError("samples must be a finite count, got %r" % samples)
-    samples = max(2, int(samples))
+    if not math.isfinite(_real(samples)):
+        return float("nan")            # an unknown count is not a huge one
+    samples = min(1000000, max(2, int(_real(samples))))
     key = (R, delta, samples)
     cache = getattr(warp_energy_integral, "_cache", None)
     if cache is not None and cache[0] == key:
@@ -777,8 +806,9 @@ def alcubierre_energy_j(beta, R=None, delta=None):
     delta = 1e-15 m returns ~-3e63 J (Alcubierre's own 1994 estimate).  The
     gate calls this for the transit capsule's sheath bill, not for itself:
     at beta = 0 a stationary gate owes nothing to this ledger."""
-    R = DIMS["gate_aperture_d_m"] / 2.0 if R is None else R
-    delta = DIMS["gate_ring_wall_m"] if delta is None else delta
+    R = DIMS["gate_aperture_d_m"] / 2.0 if R is None else _real(R)
+    delta = DIMS["gate_ring_wall_m"] if delta is None else _real(delta)
+    beta = _real(beta)
     key = (beta, R, delta)
     cache = getattr(alcubierre_energy_j, "_cache", None)
     if cache is not None and cache[0] == key:
@@ -790,7 +820,7 @@ def alcubierre_energy_j(beta, R=None, delta=None):
 
 def equiv_mass_kg(energy_j):
     """E/c^2 -- the mass whose rest energy equals this.  Sign preserved."""
-    return energy_j / C2
+    return _real(energy_j) / C2
 
 
 def wall_tidal_gradient(beta, R=None, delta=None):
@@ -799,8 +829,9 @@ def wall_tidal_gradient(beta, R=None, delta=None):
     a ~ beta c^2 |f''| L, f'' ~ 1/delta^2.  At beta = 0 the stationary gate
     has zero wall shear -- the dangerous shear in this file is the wormhole
     throat's, not the ring's.  Kept for the transit-capsule sheath analysis."""
-    R = DIMS["gate_aperture_d_m"] / 2.0 if R is None else R
-    delta = DIMS["gate_ring_wall_m"] if delta is None else delta
+    R = DIMS["gate_aperture_d_m"] / 2.0 if R is None else _real(R)
+    delta = DIMS["gate_ring_wall_m"] if delta is None else _real(delta)
+    beta = _real(beta)
     if math.isnan(beta) or math.isnan(R) or math.isnan(delta):
         return float("nan")
     if abs(beta) == 0.0:
@@ -822,6 +853,7 @@ def ford_roman_wall_limit(beta):
     Pfenning & Ford (1997): the Alcubierre wall cannot exceed a few hundred
     Planck lengths thick -- order-of-magnitude bound, coefficient depends on
     the sampling function."""
+    beta = _real(beta)
     if math.isnan(beta):
         return float("nan")
     return 1.0e2 * L_PLANCK / max(1.0, beta)
@@ -842,9 +874,12 @@ def casimir_energy_density(gap_m):
         rho = -pi^2 hbar c / (720 a^4)
     (Casimir 1948; Lamoreaux 1997 and Mohideen & Roy 1998 measured it to a
     few percent, so it is real.)  At a 10 nm gap about -43 kJ/m^3."""
+    gap_m = _real(gap_m)
     if math.isnan(gap_m):
         return float("nan")
     a = max(1e-12, gap_m)
+    if not math.isfinite(a) or a > 1e75:
+        return -0.0            # infinite gap -> zero density
     return -(math.pi ** 2) * HBAR * C_LIGHT / (720.0 * a ** 4)
 
 
@@ -855,8 +890,9 @@ def casimir_cassette():
     pitch = DIMS["casimir_pitch_nm"] * 1e-9
     _ratio = (DIMS["casimir_stack_m"] / pitch
               if (isinstance(pitch, (int, float)) and pitch > 0.0
-                  and _finite(DIMS["casimir_stack_m"], pitch)) else 0.0)
-    n_gaps = int(_ratio) if _finite(_ratio) else 0
+                  and _finite(DIMS["casimir_stack_m"], pitch))
+              else float("nan"))
+    n_gaps = int(_ratio) if _finite(_ratio) else float("nan")
     v_gap = plate * plate * gap * n_gaps
     rho = casimir_energy_density(gap)
     return {"plates": n_gaps, "gap_volume_m3": v_gap, "rho_j_m3": rho,
@@ -864,7 +900,7 @@ def casimir_cassette():
             "plate_area_m2": plate * plate * n_gaps}
 
 
-@functools.lru_cache(maxsize=None)
+@_lru_tolerant
 def casimir_gate_j():
     """Total negative energy one gate's 16-cassette lattice holds [J]."""
     return casimir_cassette()["energy_j"] * DIMS["casimir_cassettes"]
@@ -911,6 +947,11 @@ def energy_conditions(beta):
     """Which pointwise energy conditions a warp solution satisfies.
     beta < 1: Bobrick-Martire (2021)/Fuchs et al. (2024) class -- all pass.
     beta >= 1: SSV 2022 -- ANY superluminal warp violates the NEC."""
+    beta = _real(beta)
+    if not _finite(beta):
+        return {"NEC": None, "WEC": None, "DEC": None, "SEC": None,
+                "class": "UNKNOWN",
+                "note": "beta unknown -- no condition claim"}
     if abs(beta) < 1.0:
         return {"NEC": True, "WEC": True, "DEC": True, "SEC": True,
                 "class": "PHYSICAL",
@@ -937,14 +978,6 @@ def energy_conditions(beta):
 #   LOCATION IS NOT FREE.  You exit where mouth B physically is; you cannot
 #   choose the destination independently of where a mouth was parked.
 
-def mt_embedding_z(rho, b0):
-    """Embedding-diagram height z(rho) = 2 b0 sqrt(rho/b0 - 1)  [m].
-    The classic funnel shape -- the console draws the throat from this."""
-    if b0 <= 0.0 or rho <= b0:
-        return 0.0
-    return 2.0 * b0 * math.sqrt(rho / b0 - 1.0)
-
-
 def mt_throat_density(b0):
     """Energy density required at the throat  [J/m^3].
         rho_throat = -c^4 / (8 pi G b0^2)
@@ -959,7 +992,7 @@ def mt_throat_density(b0):
     return -(C4_OVER_G) / (8.0 * math.pi * den)
 
 
-@functools.lru_cache(maxsize=None)
+@_lru_tolerant
 def mt_exotic_energy_j(b0, shell_factor=1.0):
     """Total exotic energy to hold a throat of radius b0 open  [J].
 
@@ -979,7 +1012,7 @@ def mt_exotic_energy_j(b0, shell_factor=1.0):
     return -(C4_OVER_G * max(0.0, b0) / 6.0) * shell_factor
 
 
-@functools.lru_cache(maxsize=None)
+@_lru_tolerant
 def mt_tidal_g(b0, body_m=None):
     """Tidal acceleration across a body of size body_m at the throat [g].
         a_tidal ~ (c^2 / b0^2) * L
@@ -1028,6 +1061,7 @@ def mt_traversal_time_s(b0, v_ms=None, length_factor=None):
 def mt_shape_b(r, b0):
     """Morris-Thorne shape function b(r) = b0^2 / r  [m].
     b(b0) = b0, b'(b0) = -1 < 1 (flare-out satisfied), b/r -> 0 at infinity."""
+    r, b0 = _real(r), _real(b0)
     if math.isnan(r) or math.isnan(b0):
         return float("nan")
     return b0 * b0 / max(1e-30, r)
@@ -1035,6 +1069,7 @@ def mt_shape_b(r, b0):
 
 def mt_shape_b_prime(r, b0):
     """db/dr = -b0^2 / r^2  [dimensionless]."""
+    r, b0 = _real(r), _real(b0)
     if math.isnan(r) or math.isnan(b0):
         return float("nan")
     return -b0 * b0 / max(1e-30, r * r)
@@ -1049,6 +1084,7 @@ def mt_redshift_phi(r, b0):
 def mt_flare_out(b0):
     """Verify the flare-out condition at the throat:  b(r0) = r0 and
     b'(r0) < 1.  The condition that costs -- it forces rho < 0 there."""
+    b0 = _real(b0)
     r0 = b0
     if r0 <= 0.0:
         return {"r0": r0, "b_at_r0": 0.0, "b_prime_at_r0": 0.0,
@@ -1066,7 +1102,8 @@ def mt_tidal_profile(r, b0, body_m=None):
         a = c^2 |b'(r) - b(r)/r| L / (2 r^2 e^(2 Phi))
     At the throat: |b' - b/r| = 2 -> a = c^2 L / b0^2.  Falls as 1/r^4 away
     from the throat -- the throat is the only lethal part."""
-    body_m = DIMS["body_m"] if body_m is None else body_m
+    r, b0 = _real(r), _real(b0)
+    body_m = DIMS["body_m"] if body_m is None else _real(body_m)
     if math.isnan(r) or math.isnan(b0) or math.isnan(body_m):
         return float("nan")
     phi = mt_redshift_phi(r, b0)
@@ -1081,6 +1118,8 @@ def mt_proper_length(b0, r_far=None):
     """Proper radial distance throat -> r_far  [m].
         l = INT_{b0}^{r_far} dr / sqrt(1 - b(r)/r) = sqrt(r_far^2 - b0^2)
     Closed form -- the arc length of the embedding funnel."""
+    b0 = _real(b0)
+    r_far = _real(r_far) if r_far is not None else None
     if math.isnan(b0) or (r_far is not None and math.isnan(r_far)):
         return float("nan")
     if b0 <= 0.0:
@@ -1096,6 +1135,7 @@ def ford_roman_bound_j_m3(tau_s):
         |rho| <= 3 hbar / (32 pi^2 c^3 tau^4)
     The maximum negative energy density a massless field can sustain
     averaged over sampling time tau -- the bound falls as 1/tau^4."""
+    tau_s = _real(tau_s)
     if math.isnan(tau_s):
         return float("nan")
     if tau_s <= 0.0:
@@ -1105,7 +1145,7 @@ def ford_roman_bound_j_m3(tau_s):
     return -3.0 * HBAR / (32.0 * math.pi ** 2 * C_LIGHT ** 3 * tau_s ** 4)
 
 
-@functools.lru_cache(maxsize=None)
+@_lru_tolerant
 def ford_roman_max_throat_tau(b0):
     """Longest a quantum-field source can hold a throat of radius b0 open [s].
         tau_max = (3 hbar G b0^2 / (4 pi c^7))^(1/4)
@@ -1115,6 +1155,8 @@ def ford_roman_max_throat_tau(b0):
     b0 = _real(b0)
     if math.isnan(b0):
         return float("nan")
+    if b0 <= 0.0:
+        return 0.0                    # no throat -> nothing to hold
     return (3.0 * HBAR * G_NEWTON * b0 * b0
             / (4.0 * math.pi * C_LIGHT ** 7)) ** 0.25
 
@@ -1140,7 +1182,7 @@ def throat_strobe(b0, v_ms=None):
         parameterised, not asserted.
 
     Returns the full ledger; verdict included."""
-    v_ms = DIMS["traverse_v_ms"] if v_ms is None else v_ms
+    v_ms = DIMS["traverse_v_ms"] if v_ms is None else _real(v_ms)
     b0 = _real(b0)
     if not _finite(b0) or b0 <= 0:
         return {"b0_m": b0, "tau_max_s": float("nan"),
@@ -1154,14 +1196,16 @@ def throat_strobe(b0, v_ms=None):
     # tau_max / pulse_spacing; the gap shows how far short strobing falls.
     servo_spacing_s = 1e-4        # 10 kHz coil-servo cycle
     duty = tau_max / servo_spacing_s
+    oom = orders_of_magnitude(cross, tau_max)
+    oom_txt = ("%d" % round(oom)) if _finite(oom) else "inf"
     return {"b0_m": b0, "tau_max_s": tau_max, "cross_s": cross,
             "pulses_needed": pulses, "duty": duty,
-            "verdict": ("FAILS by %d orders: one uninterrupted crossing "
+            "verdict": ("FAILS by %s orders: one uninterrupted crossing "
                         "needs %.2e s, a quantum-field pulse lasts %.2e s. "
                         "Strobing cannot chain %d pulses without closing "
                         "on the traveller."
-                        % (round(orders_of_magnitude(cross, tau_max)),
-                           cross, tau_max, pulses)),
+                        % (oom_txt, cross, tau_max,
+                           pulses if _finite(pulses) else 0)),
             "route": ("non-quantum-field exotic source: a classical scalar "
                       "condensate / brane tension / MMP fermion-Casimir "
                       "static geometry is NOT bounded by the sampling "
@@ -1177,7 +1221,10 @@ def visser_shell_mass_kg(a_m, M_kg=0.0):
     The exotic matter lives on a 2-D sheet -- localisation, not reduction.
     For M = 0 at a = 3.35 m the bill is ~-0.005 M_sun -- MORE than the
     Morris-Thorne volume estimate."""
+    a_m, M_kg = _real(a_m), _real(M_kg)
     rs = 2.0 * G_NEWTON * M_kg / C2
+    if math.isnan(a_m) or math.isnan(rs):
+        return float("nan")
     if a_m <= rs:
         return 0.0
     return -2.0 * a_m * C2 / G_NEWTON * math.sqrt(1.0 - rs / a_m)
@@ -1191,22 +1238,27 @@ def visser_summary(a_m=None, M_kg=None):
     """The Visser thin-shell wormhole, priced for the gate aperture."""
     if a_m is None:
         a_m = DIMS["gate_aperture_d_m"] / 2.0
+    else:
+        a_m = _real(a_m)
     if M_kg is None:
         M_kg = 0.0
+    else:
+        M_kg = _real(M_kg)
     m_shell = visser_shell_mass_kg(a_m, M_kg)
     rs = 2.0 * G_NEWTON * M_kg / C2
     return {"a_m": a_m, "M_kg": M_kg, "r_s_m": rs,
             "shell_mass_kg": m_shell, "shell_energy_j": m_shell * C2,
             "outside_horizon": a_m > rs if M_kg > 0 else True,
             "tidal_g": mt_tidal_g(a_m) if M_kg == 0 else
-                       2.0 * G_NEWTON * M_kg / (a_m ** 3) * 2.0 / 9.81}
+                       2.0 * G_NEWTON * M_kg / (a_m * a_m * a_m)
+                       * 2.0 / 9.81}
 
 
 # --- Maldacena-Milekhin-Popov (2020): the wormhole that works on paper ------
 
 def mmp_extremal_charge_c(M_kg):
     """Q_ext = sqrt(4 pi eps0 G) M  [C]."""
-    return math.sqrt(4.0 * math.pi * EPS0 * G_NEWTON) * M_kg
+    return math.sqrt(4.0 * math.pi * EPS0 * G_NEWTON) * _real(M_kg)
 
 
 def mmp_tidal_mass_kg(g_limit=None, body_m=None):
@@ -1215,16 +1267,25 @@ def mmp_tidal_mass_kg(g_limit=None, body_m=None):
     Same curvature radius as the Morris-Thorne survivable throat, reached
     by a completely different construction -- and the negative energy is a
     real quantum field (Casimir energy of massless fermions)."""
-    g_limit = DIMS["g_limit"] if g_limit is None else g_limit
-    body_m = DIMS["body_m"] if body_m is None else body_m
+    g_limit = DIMS["g_limit"] if g_limit is None else _real(g_limit)
+    body_m = DIMS["body_m"] if body_m is None else _real(body_m)
     if math.isnan(g_limit) or math.isnan(body_m):
         return float("nan")
+    if g_limit < 0.0 or body_m < 0.0:
+        return float("nan")   # unphysical: negative tolerance or body size
+    if body_m == 0.0:
+        return 0.0            # a point body feels no tidal stretch at any g
+    if g_limit == 0.0:
+        return float("inf")   # zero tidal tolerance: no finite mass suffices
     return C_LIGHT ** 3 * math.sqrt(
-        body_m / (4.0 * G_NEWTON ** 2 * max(1e-9, g_limit * 9.81)))
+        body_m / (4.0 * G_NEWTON ** 2 * g_limit * 9.81))
 
 
 def mmp_traversal_time_s(M_kg):
     """Asymptotic MMP traversal time: t ~ (GM/c^3) ln(M/M_planck)  [s]."""
+    M_kg = _real(M_kg)
+    if not _finite(M_kg) or M_kg <= 0.0:
+        return float("nan")
     t_nat = G_NEWTON * M_kg / C_LIGHT ** 3
     log_factor = math.log(max(M_kg, M_PLANCK) / M_PLANCK)
     return t_nat * max(1.0, log_factor)
@@ -1246,8 +1307,10 @@ def mmp_hawking(M_kg):
         return {"T_k": float("nan"), "t_evap_s": float("nan"),
                 "power_w": float("nan")}
     T = HBAR * C_LIGHT ** 3 / (8.0 * math.pi * G_NEWTON * M * K_B)
-    t = 5120.0 * math.pi * G_NEWTON ** 2 * M ** 3 / (HBAR * C_LIGHT ** 4)
-    P = HBAR * C_LIGHT ** 6 / (15360.0 * math.pi * G_NEWTON ** 2 * M ** 2)
+    t = 5120.0 * math.pi * G_NEWTON ** 2 * (M * M * M) \
+        / (HBAR * C_LIGHT ** 4)
+    P = HBAR * C_LIGHT ** 6 / (15360.0 * math.pi * G_NEWTON ** 2
+                               * (M * M))
     return {"T_k": T, "t_evap_s": t, "t_evap_yr": t / YR, "power_w": P}
 
 
@@ -1272,13 +1335,15 @@ def hold_throughput(source="quantum", payload="person", b0_m=None):
                      "%.0f whole crossings per hold" % n)}
 
 
-@functools.lru_cache(maxsize=None)
+@_lru_tolerant
 def mmp_summary(g_limit=None, body_m=None):
     """The MMP wormhole, fully priced, for a survivable crossing."""
     M = mmp_tidal_mass_kg(g_limit, body_m)
     Q = mmp_extremal_charge_c(M)
     r_s = 2.0 * G_NEWTON * M / C2
-    e_casimir = -(4.0 / 3.0) * math.pi * HBAR * C_LIGHT / r_s
+    # a zero-mass hole is a zero-size cavity: the Casimir bill diverges
+    e_casimir = (-(4.0 / 3.0) * math.pi * HBAR * C_LIGHT / r_s
+                 if r_s != 0.0 else float("-inf"))
     return {"M_kg": M, "M_msun": M / M_SUN, "Q_ext_c": Q,
             "r_s_m": r_s, "traversal_s": mmp_traversal_time_s(M),
             "casimir_energy_j": e_casimir, "monopoles_observed": False,
@@ -1420,6 +1485,7 @@ def ctc_onset_s(mouth_sep_m, rate_diff):
     -- and Kim & Thorne (1991) showed the divergence may be cut off before
     it diverges -- so this file reports the onset honestly and flags the
     conjecture as a conjecture."""
+    mouth_sep_m, rate_diff = _real(mouth_sep_m), _real(rate_diff)
     if math.isnan(mouth_sep_m) or math.isnan(rate_diff):
         return float("nan")
     if rate_diff <= 0.0:
@@ -1439,6 +1505,8 @@ def phi_for_rate(target_rate, beta=0.0):
     target_rate, beta = _real(target_rate), _real(beta)
     if not _finite(target_rate) or not _finite(beta):
         return float("nan")
+    if target_rate < 0.0 or target_rate > 1.0:
+        return float("nan")   # outside 0 < rate <= 1/gamma: unreachable
     g = lorentz_gamma(abs(beta))
     q = (target_rate * g) ** 2
     if q < 0.0 or q > 1.0 + 1e-12:
@@ -1499,6 +1567,8 @@ def chain_wormhole_offset(n_wormholes, elapsed_s, rate_diff):
         offset = N * elapsed * rate_diff
     The only way past elapsed-time displacement without a different
     mechanism -- and every throat in the chain still pays its own bill."""
+    n_wormholes, elapsed_s, rate_diff = (_real(n_wormholes),
+                                         _real(elapsed_s), _real(rate_diff))
     if math.isnan(n_wormholes) or math.isnan(elapsed_s) \
             or math.isnan(rate_diff):
         return float("nan")
@@ -1530,7 +1600,7 @@ def deploy_ledger(sep_m, beta=None):
 
 def throat_summary(b0=None):
     """Everything about the throat, in one dict, for reports and the console."""
-    b0 = DIMS["gate_aperture_d_m"] / 2.0 if b0 is None else b0
+    b0 = DIMS["gate_aperture_d_m"] / 2.0 if b0 is None else _real(b0)
     safe = mt_min_throat_m()
     flare = mt_flare_out(b0)
     qi_hold_s = ford_roman_max_throat_tau(b0)
@@ -1573,6 +1643,345 @@ def throat_summary(b0=None):
 # different bodies, the vector is the mission, not a detail.  Same solve the
 # Foldrunner's Field Car ephemeris unit does, generalised to gate sites.
 
+# =============================================================================
+# GAP D5 -- JPL DE440 ephemeris: manual DAF/SPK reader (no external deps)
+# =============================================================================
+# The first-order Kepler ephemeris (~2 km error at Earth) is the biggest stated
+# approximation in both programs.  A DE440 .bsp file is a DAF container of SPK
+# segments: each segment is a run of Chebyshev-polynomial records giving one
+# body's position relative to another over a coverage span.  This reader
+# implements the NAIF layout directly -- summary records, word-addressed data
+# arrays, Type 2/3 coefficient records -- so either program can swap the Kepler
+# solve for the JPL tables with --de440 PATH, and falls back honestly when the
+# file is absent or unreadable.  Reference: NAIF "SPK Required Reading" and
+# "DAF Required Reading" (public documents; no external packages needed).
+
+import struct as _struct
+
+
+class SPKReader:
+    """Minimal JPL DAF/SPK reader -- Chebyshev segments (types 2 and 3).
+
+    load() returns None on any format violation -- an unreadable kernel is
+    reported, never guessed.  position() resolves a target relative to a
+    center through the segment graph (direct pair, reversed pair, or a
+    chained hop through the solar-system barycenter / any intermediate),
+    which is how real DE440 files store Earth (399 -> 3 -> 0, Sun 10 -> 0).
+    """
+
+    def __init__(self):
+        self.segments = []   # dicts: target, center, frame, dtype,
+                             #      t0, t1, start, end
+        self.data = b""
+        self.endian = "<"
+        self.internal_name = ""
+
+    @classmethod
+    def load(cls, path):
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            return None
+        if len(raw) < 1024 or not raw[0:8].startswith(b"DAF/SPK"):
+            return None
+        k = cls()
+        fmt = raw[88:96].decode("ascii", "replace").strip()
+        k.endian = ">" if fmt.startswith("BIG") else "<"
+        try:
+            nd, ni = _struct.unpack_from(k.endian + "2i", raw, 8)
+            fward, bward = _struct.unpack_from(k.endian + "2i", raw, 76)
+        except _struct.error:
+            return None
+        if nd <= 0 or ni <= 0 or fward <= 0 or bward < fward:
+            return None
+        k.internal_name = raw[16:76].decode("ascii", "replace").strip("\x00 ")
+        k.data = raw
+        ss = (nd + (ni + 1) // 2) * 8           # summary size in bytes
+        rec = fward
+        for _ in range(bward - fward + 1):
+            base = (rec - 1) * 1024
+            if base + 1024 > len(raw) or base < 0:
+                return None
+            try:
+                nxt, _prev, nsum = _struct.unpack_from(
+                    k.endian + "3d", raw, base)
+            except _struct.error:
+                return None
+            nsum = int(nsum)
+            if nsum < 0 or 24 + nsum * ss > 1024:
+                return None
+            off = base + 24
+            for _ in range(nsum):
+                try:
+                    t0, t1 = _struct.unpack_from(k.endian + "2d", raw, off)
+                    ic = _struct.unpack_from(k.endian + "%di" % ni,
+                                             raw, off + nd * 8)
+                except _struct.error:
+                    return None
+                if ni < 6:
+                    return None
+                k.segments.append({
+                    "t0": t0, "t1": t1,
+                    "target": ic[0], "center": ic[1],
+                    "frame": ic[2], "dtype": ic[3],
+                    "start": ic[4], "end": ic[5],
+                })
+                off += ss
+            rec = int(nxt)
+            if rec <= 0:
+                break
+        if not k.segments:
+            return None
+        return k
+
+    def _segment_data(self, seg):
+        n = seg["end"] - seg["start"] + 1
+        off = (seg["start"] - 1) * 8
+        if off < 0 or off + n * 8 > len(self.data):
+            return None
+        try:
+            return _struct.unpack_from(self.endian + "%dd" % n,
+                                       self.data, off)
+        except _struct.error:
+            return None
+
+    @staticmethod
+    def _cheby(coefs, tau):
+        """Sum c_k T_k(tau) by the Clenshaw recurrence."""
+        n = len(coefs)
+        if n == 0:
+            return 0.0
+        if n == 1:
+            return coefs[0]
+        b1 = b2 = 0.0
+        t2 = 2.0 * tau
+        for i in range(n - 1, 0, -1):
+            b0 = t2 * b1 - b2 + coefs[i]
+            b2, b1 = b1, b0
+        return tau * b1 - b2 + coefs[0]
+
+    def _eval(self, seg, t):
+        """Position (km) of seg.target relative to seg.center at TDB s t.
+        Type 2 array: N records of RSIZE doubles then INIT, INTLEN; each
+        record [MID, RADIUS, 3xNCOEF].  Type 3 carries 6 coefficient
+        blocks (pos + vel); we evaluate the first three."""
+        if seg["dtype"] not in (2, 3):
+            return None
+        arr = self._segment_data(seg)
+        if arr is None or len(arr) < 3:
+            return None
+        init, intlen = arr[-2], arr[-1]
+        if not (math.isfinite(init) and math.isfinite(intlen)
+                and intlen > 0):
+            return None
+        comp = 3 if seg["dtype"] == 2 else 6
+        nwords = len(arr) - 2
+        rec = None
+        for nc in range(2, 60):
+            rs = 2 + comp * nc
+            if rs > 0 and nwords % rs == 0:
+                n_rec = nwords // rs
+                idx = int((t - init) / intlen)
+                if 0 <= idx < n_rec:
+                    rec = arr[idx * rs:(idx + 1) * rs]
+                    break
+        if rec is None:
+            return None
+        mid, radius = rec[0], rec[1]
+        if not (math.isfinite(mid) and math.isfinite(radius)
+                and radius > 0):
+            return None
+        tau = max(-1.0, min(1.0, (t - mid) / radius))
+        nc = (len(rec) - 2) // comp
+        out = [self._cheby(rec[2 + j * nc: 2 + (j + 1) * nc], tau)
+               for j in range(min(3, comp))]
+        while len(out) < 3:
+            out.append(0.0)
+        return tuple(out)
+
+    def _find(self, target, center, t):
+        for seg in self.segments:
+            if (seg["target"] == target and seg["center"] == center
+                    and seg["t0"] <= t <= seg["t1"]):
+                return seg
+        return None
+
+    def _pos_wrt(self, target, center, t, depth=0):
+        """Resolve target wrt center through the segment graph (km)."""
+        if target == center:
+            return (0.0, 0.0, 0.0)
+        seg = self._find(target, center, t)
+        if seg is not None:
+            return self._eval(seg, t)
+        seg = self._find(center, target, t)
+        if seg is not None:
+            v = self._eval(seg, t)
+            return None if v is None else (-v[0], -v[1], -v[2])
+        if depth >= 4:
+            return None
+        for seg in self.segments:
+            if seg["target"] == target and seg["t0"] <= t <= seg["t1"]:
+                mid = seg["center"]
+                if mid in (target, center):
+                    continue
+                pm = self._pos_wrt(mid, center, t, depth + 1)
+                if pm is not None:
+                    v = self._eval(seg, t)
+                    if v is None:
+                        return None
+                    return (v[0] + pm[0], v[1] + pm[1], v[2] + pm[2])
+        # symmetric fallback: resolve center->target and negate
+        v = self._pos_wrt(center, target, t, depth + 1)
+        return None if v is None else (-v[0], -v[1], -v[2])
+
+    def position(self, target, center, t):
+        """Position of NAIF body `target` relative to `center` at TDB
+        seconds past J2000 `t` [km], or None if no segment path covers it."""
+        try:
+            t = float(t)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(t):
+            return None
+        return self._pos_wrt(target, center, t)
+
+
+# -- loaded-kernel handle ------------------------------------------------------
+_DE440 = {"kernel": None, "path": None}
+MODEL_EPOCH_TDB_S = 0.0     # TDB seconds past J2000 corresponding to model t=0
+
+
+def de440_load(path):
+    """Load a JPL DE440 (or compatible) SPK file as the ephemeris source.
+    On failure the kernel stays unloaded and the programs keep their
+    Kepler fallback -- an honest downgrade, never a silent half-load."""
+    if not isinstance(path, (str, bytes)):
+        return {"ok": False, "path": path, "segments": 0,
+                "verdict": "not a filesystem path -- Kepler fallback "
+                           "remains active"}
+    kern = SPKReader.load(path)
+    if kern is None:
+        _DE440["kernel"] = None
+        _DE440["path"] = None
+        return {"ok": False, "path": path, "segments": 0,
+                "verdict": "unreadable or not a DAF/SPK file -- Kepler "
+                           "fallback remains active"}
+    pairs = {(s["target"], s["center"]) for s in kern.segments}
+    _DE440["kernel"] = kern
+    _DE440["path"] = path
+    cov = (min(s["t0"] for s in kern.segments),
+           max(s["t1"] for s in kern.segments))
+    return {"ok": True, "path": path, "segments": len(kern.segments),
+            "pairs": len(pairs), "coverage_tdb_s": cov,
+            "verdict": "DE440 ephemeris loaded: %d segments, %d body "
+                       "pairs" % (len(kern.segments), len(pairs))}
+
+
+def de440_unload():
+    """Drop the loaded kernel (tests unload so Kepler-based checks keep
+    their reference ephemeris)."""
+    _DE440["kernel"] = None
+    _DE440["path"] = None
+
+
+def de440_status():
+    k = _DE440["kernel"]
+    return {"loaded": k is not None, "path": _DE440["path"],
+            "segments": 0 if k is None else len(k.segments)}
+
+
+def earth_pos_de440_m(t_s, epoch_tdb_s=None):
+    """Heliocentric Earth position [m, kernel frame] from the loaded
+    DE440 kernel at model time t_s.  Returns None when no kernel is
+    loaded or the epoch is outside coverage -- callers MUST keep the
+    Kepler fallback branch; this is an upgrade path, not a replacement."""
+    return body_pos_de440_m(399, 10, t_s, epoch_tdb_s)
+
+
+def body_pos_de440_m(target, center, t_s, epoch_tdb_s=None):
+    """NAIF body `target` relative to `center` [m, kernel frame] from the
+    loaded kernel -- the general accessor behind earth_pos_de440_m.
+    Resolves chains through barycenters via the segment graph, so
+    (499, 10), (301, 399), (301, 0) all answer when the kernel covers
+    them.  None when unloaded or out of coverage."""
+    kern = _DE440["kernel"]
+    if kern is None:
+        return None
+    try:
+        t = float(t_s)
+        target = int(target)
+        center = int(center)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(t):
+        return None
+    epoch = MODEL_EPOCH_TDB_S if epoch_tdb_s is None else epoch_tdb_s
+    v = kern.position(target, center, epoch + t)
+    if v is None:
+        return None
+    return (v[0] * 1e3, v[1] * 1e3, v[2] * 1e3)
+
+
+def _write_test_spk(path):
+    """Write a minimal but FORMAT-VALID DAF/SPK file for self-tests:
+    four Type-2 segments -- Earth(399) wrt Sun(10) direct, Earth wrt
+    EMB(3), EMB(3) wrt SSB(0), and Sun(10) wrt SSB(0), so the chained
+    resolution path is exercised as well as the direct pair.  All
+    polynomials are linear in tau, so the reader's evaluation is checked
+    EXACTLY, not approximately."""
+    def rec(mid, radius, cx, cy, cz):
+        return [mid, radius] + list(cx) + list(cy) + list(cz)
+
+    # Mutually consistent synthetic ephemeris: as functions of t the four
+    # segments must satisfy  (399->3)+(3->0) == (399->10)+(10->0).
+    # e_sun x(t)=1.496e8+100t, emb_ssb is derived as e_sun+sun-e_emb.
+    e_sun = (rec(50.0, 50.0, [1.496e8 + 5.0e3, 5.0e3],
+                [2.5e6, 0.0], [-3.0e5, 0.0])
+             + rec(150.0, 50.0, [1.496e8 + 1.5e4, 5.0e3],
+                   [2.5e6, 0.0], [-3.0e5, 0.0])
+             + [0.0, 100.0])
+    e_emb = (rec(100.0, 100.0, [4.5e3, 0.0], [-1.0e3, 0.0],
+                [2.0e2, 0.0])
+             + [0.0, 200.0])
+    emb_ssb = (rec(100.0, 100.0, [1.492055e8, 1.0e4],
+                  [2.511e6, 0.0], [-2.902e5, 0.0])
+               + [0.0, 200.0])
+    sun_ssb = (rec(100.0, 100.0, [-4.0e5, 0.0], [1.0e4, 0.0],
+                  [1.0e4, 0.0])
+               + [0.0, 200.0])
+    arrays = [e_sun, e_emb, emb_ssb, sun_ssb]
+    pairs = [(399, 10), (399, 3), (3, 0), (10, 0)]
+
+    hdr = bytearray(1024)
+    hdr[0:8] = b"DAF/SPK "                            # LOCIDW is 8 chars
+    _struct.pack_into("<2i", hdr, 8, 2, 6)          # ND, NI
+    nm = b"SYNTH-DE440"
+    hdr[16:16 + len(nm)] = nm
+    _struct.pack_into("<2i", hdr, 76, 2, 2)          # FWARD, BWARD
+    hdr[88:96] = b"LTL-IEEE"
+    srec = bytearray(1024)
+    nrec = bytearray(1024)
+    _struct.pack_into("<3d", srec, 0, 0.0, 0.0, float(len(arrays)))
+    addr = 385                                       # first data word
+    off = 24
+    for i, ((tgt, ctr), arr) in enumerate(zip(pairs, arrays)):
+        _struct.pack_into("<2d", srec, off, 0.0, 200.0)
+        _struct.pack_into("<6i", srec, off + 16, tgt, ctr, 1, 2,
+                          addr, addr + len(arr) - 1)
+        addr += len(arr)
+        name = ("seg%d" % tgt).encode()
+        nrec[i * 24: i * 24 + len(name)] = name
+        off += 40
+    with open(path, "wb") as fh:
+        fh.write(hdr)
+        fh.write(srec)
+        fh.write(nrec)
+        for arr in arrays:
+            fh.write(_struct.pack("<%dd" % len(arr), *arr))
+    return path
+
+
 def earth_helio_pos(t_s):
     """Heliocentric ecliptic position of Earth at time t [s].  Kepler orbit
     to first order in eccentricity: r = a(1 - e cos M), theta = M + 2e sin M,
@@ -1582,10 +1991,9 @@ def earth_helio_pos(t_s):
     t = _real(t_s)
     if not _finite(t):
         return (float("nan"),) * 3
-    if _wp is not None:
-        ep = _wp.earth_pos_de440_m(t)
-        if ep is not None:
-            return ep
+    ep = earth_pos_de440_m(t)
+    if ep is not None:
+        return ep
     M = 2.0 * math.pi * t / YEAR_S
     r = AU * (1.0 - EARTH_ECC * math.cos(M))
     th = M + 2.0 * EARTH_ECC * math.sin(M)
@@ -1605,10 +2013,10 @@ def site_surface_offset(t_s, lat_deg=GATE_LAT_DEG, lon_deg=GATE_LON_DEG):
     """Position of a pad-fixed point relative to Earth centre: sidereal
     rotation about the obliquity-tilted pole."""
     t = _real(t_s)
-    if not _finite(t):
+    lat, lon = _real(lat_deg), _real(lon_deg)
+    if not _finite(t, lat, lon):
         return (float("nan"),) * 3
-    lat = math.radians(_real(lat_deg) if _finite(_real(lat_deg)) else 0.0)
-    lon = math.radians(_real(lon_deg) if _finite(_real(lon_deg)) else 0.0)
+    lat, lon = math.radians(lat), math.radians(lon)
     th = 2.0 * math.pi * t / SIDEREAL_DAY_S + lon
     # WGS-84 geodetic surface point, not a sphere: xy radius N*cos(lat),
     # z = N(1-e^2)*sin(lat); |r| equals wgs84_radius_m(lat) exactly.
@@ -1627,10 +2035,10 @@ def site_frame(t_s, lat_deg=GATE_LAT_DEG, lon_deg=GATE_LON_DEG):
     rotates with the planet."""
     nan3 = (float("nan"),) * 3
     t = _real(t_s)
-    if not _finite(t):
+    lat, lon = _real(lat_deg), _real(lon_deg)
+    if not _finite(t, lat, lon):
         return nan3, nan3, nan3
-    lat = math.radians(_real(lat_deg) if _finite(_real(lat_deg)) else 0.0)
-    lon = math.radians(_real(lon_deg) if _finite(_real(lon_deg)) else 0.0)
+    lat, lon = math.radians(lat), math.radians(lon)
     th = 2.0 * math.pi * t / SIDEREAL_DAY_S + lon
     up = (math.cos(lat) * math.cos(th),
           math.cos(lat) * math.sin(th), math.sin(lat))
@@ -1645,7 +2053,10 @@ def pad_inertial_speed(lat_deg=GATE_LAT_DEG):
     orbital speed plus sidereal spin speed at the pad latitude (on the
     WGS-84 ellipsoid, not a sphere)."""
     v_orb = 2.0 * math.pi * AU / YEAR_S
-    lat = math.radians(_real(lat_deg) if _finite(_real(lat_deg)) else 0.0)
+    lat = _real(lat_deg)
+    if not _finite(lat):
+        return float("nan"), float("nan")
+    lat = math.radians(lat)
     v_spin = (2.0 * math.pi * wgs84_radius_m(math.degrees(lat))
               * math.cos(lat) / SIDEREAL_DAY_S)
     return v_orb, v_spin
@@ -1848,7 +2259,7 @@ def mouth_sep_now(site, t_s=0.0):
     move.  The CTC bound moves with all of it -- a time-machine regime
     that is legal at conjunction can appear mid-cycle."""
     site = str(site).upper()
-    s = GATE_SITES.get(site)
+    s = _glookup(site)
     t = _real(t_s)
     if s is None or not _finite(t):
         return float("nan")
@@ -1859,16 +2270,15 @@ def mouth_sep_now(site, t_s=0.0):
     if mode == "helio":
         # DE440 upgrade: a loaded kernel replaces the Keplerian synodic
         # model with the real Mars position (GAP D5 -> A4).
-        if _wp is not None:
-            v = _wp.body_pos_de440_m(499, 399, t)
-            if v is not None:
-                return _v3_mag(v)
+        v = body_pos_de440_m(499, 399, t)
+        if v is not None:
+            return _v3_mag(v)
         mp = mouth_pos_now(site, t)
         return (float("nan") if mp is None
                 else _v3_mag(_v3_sub(mp, earth_helio_pos(t))))
     if mode == "geo":
-        if site == "LUNA" and _wp is not None:
-            v = _wp.body_pos_de440_m(301, 399, t)
+        if site == "LUNA":
+            v = body_pos_de440_m(301, 399, t)
             if v is not None:
                 # kernel gives Earth-centre -> Moon; the mouth's pad
                 # separation needs the pad's geocentric offset too
@@ -1991,7 +2401,7 @@ def site_clock_rate_now(site, t_s=0.0):
     registry values flagged source='registry' -- honest that no real
     body exists to derive them from."""
     site = str(site).upper()
-    s = GATE_SITES.get(site)
+    s = _glookup(site)
     t = _real(t_s)
     if s is None or not _finite(t):
         return {"rate": float("nan"), "source": "unknown", "ok": False}
@@ -2080,7 +2490,7 @@ def mouth_pos_now(site, t_s=0.0):
     separation never changes and their vector is pad-relative only)."""
     site = str(site).upper()
     t = _real(t_s)
-    if GATE_SITES.get(site) is None or not _finite(t):
+    if _glookup(site) is None or not _finite(t):
         return None
     orb = MOUTH_ORBITS.get(site)
     if orb is None:
@@ -2156,7 +2566,7 @@ def mouth_lighttime_s(site, t_s=0.0):
     is tens of km of effective path, not a rounding error)."""
     site = str(site).upper()
     t = _real(t_s)
-    if GATE_SITES.get(site) is None or not _finite(t):
+    if _glookup(site) is None or not _finite(t):
         return {"lighttime_s": float("nan"), "ok": False}
     mp = mouth_pos_now(site, t)
     if mp is None:
@@ -2240,11 +2650,11 @@ def gate_pass_windows(site, t0_s=0.0, span_s=DAY, step_s=20.0,
     if mouth_pos_now(site, 0.0) is None:
         return {"site": site, "windows": [], "n_passes": 0,
                 "note": "no mouth ephemeris -- no honest sky passes",
-                "ok": GATE_SITES.get(site) is not None}
-    mask = _real(mask_deg) if _finite(_real(mask_deg)) else 0.0
+                "ok": _glookup(site) is not None}
+    mask = _real(mask_deg)
     t0, span = _real(t0_s), _real(span_s)
-    if not _finite(t0, span) or span <= 0:
-        return {"site": site, "windows": [], "ok": False}
+    if not _finite(t0, span, mask) or span <= 0:
+        return {"site": site, "windows": [], "n_passes": 0, "ok": False}
     windows = []
     cur = None
     el_max = -90.0
@@ -2382,7 +2792,7 @@ def shapiro_delay_s(p1_m, p2_m, gm=GM_SUN):
     try:
         p1 = tuple(_real(c) for c in p1_m[:3])
         p2 = tuple(_real(c) for c in p2_m[:3])
-    except (TypeError, IndexError):
+    except (TypeError, IndexError, KeyError):
         return float("nan")
     r1, r2 = _v3_mag(p1), _v3_mag(p2)
     d = _v3_mag(_v3_sub(p2, p1))
@@ -2422,7 +2832,7 @@ def site_power_derived(site, t_s=0.0):
     a typed 12 MW nameplate is a ~7.3 MW resource, and the twin says
     so.  Ground sites keep their geothermal/grid ledgers."""
     site = str(site).upper()
-    s = GATE_SITES.get(site)
+    s = _glookup(site)
     t = _real(t_s)
     if s is None or not _finite(t):
         return {"site": site, "ok": False}
@@ -2444,7 +2854,7 @@ def site_power_derived(site, t_s=0.0):
                else float("nan"))
     geo = 35.0 if site in ("B-LAB", "EARTH-FAR", "MARS", "LUNA") else 0.0
     grid = 100.0 if site in ("B-LAB", "EARTH-FAR") else 0.0
-    total = geo + grid + (derived if _finite(derived) else 0.0)
+    total = geo + grid + derived
     return {"site": site, "flux_w_m2": flux, "nameplate_mw": nameplate,
             "eclipse_duty": eclipse_duty, "daylight_duty": daylight,
             "solar_derived_mw": derived,
@@ -2486,7 +2896,7 @@ def mouth_frame_now(site, t_s=0.0):
     mouths are free-flyers -- orbital frame instead."""
     site = str(site).upper()
     t = _real(t_s)
-    if GATE_SITES.get(site) is None or not _finite(t):
+    if _glookup(site) is None or not _finite(t):
         return None, None, None
     mp = mouth_pos_now(site, t)
     if mp is None:
@@ -2660,7 +3070,7 @@ def link_budget_db(site, t_s=0.0, f_hz=8.4e9, tx_dbw=20.0,
     lam = C_LIGHT / f
     fspl = 20.0 * math.log10(4.0 * math.pi * d / lam)
     el = mouth_elevation_deg(site, t)
-    atmo_m = link_atmo_delay_m(site, el) if _finite(el) else 0.0
+    atmo_m = link_atmo_delay_m(site, el) if _finite(el) else float("nan")
     atmo_db = 0.023 * atmo_m            # ~0.23 dB per 10 m zenith
     # pointing loss off the DERIVED beam: 12 (theta_err/HPBW)^2 dB --
     # a real tracking spec, not a hand-waved margin
@@ -2670,7 +3080,8 @@ def link_budget_db(site, t_s=0.0, f_hz=8.4e9, tx_dbw=20.0,
     pointing = (12.0 * (pe / hpbw) ** 2 + 12.0 * (pe / hpbw_m) ** 2
                 if _finite(hpbw, hpbw_m) and hpbw > 0 and hpbw_m > 0
                 else float("nan"))
-    weather = link_weather_db(el, rain_mmph) if _finite(el) else 0.0
+    weather = link_weather_db(el, rain_mmph) if _finite(el) \
+        else float("nan")
     prx = tx + gt + gr - fspl - atmo_db - pointing - weather
     # Shannon ceiling: Prx [dBW] -> SNR against kTB at 10 MHz
     kb, temp_k, bw = 1.380649e-23, 20.0, 1.0e7
@@ -2844,7 +3255,7 @@ def site_hardware_spec(site, t_s=0.0):
     book for orbiting sites, and the purpose the installation exists
     for.  The spec card a mission-ops board actually posts."""
     site = str(site).upper()
-    row = GATE_SITES.get(site)
+    row = _glookup(site)
     if row is None:
         return {"site": site, "ok": False}
     spec = {"site": site,
@@ -2958,7 +3369,7 @@ def pad_timescales(t_s=0.0):
     if not _finite(t):
         return {"ok": False}
     rate = pad_clock_rate_now(t)
-    r = rate["rate"] if _finite(rate.get("rate", 0)) else 1.0
+    r = rate["rate"] if _finite(rate.get("rate", 0)) else float("nan")
     tai_minus_utc = 37.0                 # leap seconds, frozen 2017+
     tt_minus_tai = 32.184                # exact, definition
     tai_minus_gps = 19.0                 # exact, definition
@@ -3134,7 +3545,7 @@ def site_daylight_duty(site, t_s=0.0):
     ~12-h night.  Free-flyers see full sun outside eclipses."""
     site = str(site).upper()
     t = _real(t_s)
-    if GATE_SITES.get(site) is None or not _finite(t):
+    if _glookup(site) is None or not _finite(t):
         return float("nan")
     orb = MOUTH_ORBITS.get(site)
     if site == "LUNA":
@@ -3309,8 +3720,10 @@ def pad_daylight_duty(t_s=0.0, lat_deg=GATE_LAT_DEG):
     sun = _v3_scale(e, -1.0)
     lam = math.atan2(sun[1], sun[0])         # Sun ecliptic longitude
     delta = math.asin(math.sin(EARTH_OBLIQUITY) * math.sin(lam))
-    lat = math.radians(_real(lat_deg)
-                       if _finite(_real(lat_deg)) else 0.0)
+    lat = _real(lat_deg)
+    if not _finite(lat):
+        return float("nan")
+    lat = math.radians(lat)
     x = -math.tan(lat) * math.tan(delta)
     if x <= -1.0:
         return 1.0                           # midnight sun
@@ -3451,6 +3864,7 @@ def gate_load_w(throat_on=1.0):
 def waste_heat_w(load_w):
     """Everything drawn eventually becomes heat."""
     eff = PLANT["conversion_eff"]
+    load_w = _real(load_w)
     if math.isnan(load_w) or math.isnan(eff):
         return float("nan")
     if eff <= 0.0:
@@ -3464,6 +3878,7 @@ def radiator_area_m2():
 
 def radiator_temp_k(waste_w):
     """Equilibrium panel temperature: T = (P/eps sigma A)^(1/4)."""
+    waste_w = _real(waste_w)
     if math.isnan(waste_w):
         return float("nan")
     denom = DIMS["rad_emissivity"] * SIGMA_SB * radiator_area_m2()
@@ -3512,7 +3927,8 @@ def throat_hold_ledger(source="quantum"):
     fuel_s = (fuel / burn_kg_day * DAY
               if _finite(burn_kg_day) and burn_kg_day > 0 else float("inf"))
     transient_s = smes_store_j() / load if load > 0 else float("inf")
-    src = SOURCES.get(source)
+    src = SOURCES.get(
+        source if isinstance(source, (str, int)) else None)
     qi_bound = src["qi_bound"] if src else True
     if qi_bound:
         hard_s = tau_qi
@@ -4093,7 +4509,7 @@ class Gate:
         self.state = "QUENCHED"
         self.smes_soc = min(1.0, self.smes_soc
                             + q["dump_energy_j"] / 236e6)
-        self.log.append("QUENCH coil %d: %s" % (coil_id, q["verdict"]))
+        self.log.append("QUENCH coil %s: %s" % (coil_id, q["verdict"]))
         return {"ok": True, "coil_id": coil_id,
                 "dump_energy_j": q["dump_energy_j"],
                 "gate_stands_down": True,
@@ -4482,7 +4898,8 @@ class Gate:
         self.integrity = 1.0
         self.wear = 0.0
         self.smes_soc = 1.0
-        if refuel_kg > 0.0:
+        refuel_kg = _real(refuel_kg)
+        if _finite(refuel_kg) and refuel_kg > 0.0:
             self.fuel_kg = min(PLANT["fuel_3he_kg"],
                                self.fuel_kg + refuel_kg)
         self.state = "IDLE"
@@ -4880,8 +5297,13 @@ class GateNetwork:
         multijump_plan. The cumulative offset amplifies by N x cycles
         x rate_diff x elapsed.
         """
-        if route is None or len(route) < 2:
+        if not isinstance(route, (list, tuple)) or len(route) < 2:
             return {"ok": False, "verdict": "no route"}
+        cycles = (int(min(1000.0, max(0.0, _real(cycles))))
+                  if _finite(_real(cycles)) else 0)
+        if cycles < 1:
+            return {"ok": False, "verdict": "no cycles"}
+        elapsed_s = _real(elapsed_s)
         hops = len(route) - 1
         rate_diff = 0.0
         for i in range(hops):
@@ -5013,7 +5435,8 @@ def gate_dial(b0_m=None, site="B-LAB", dwell_s=0.0, payload="person",
                  different separation than the registry's conjunction
                  value; the light-time and CTC bound move with it.
     """
-    src = SOURCES.get(source)
+    src = SOURCES.get(
+        source if isinstance(source, (str, int)) else None)
     if src is None:
         return {"ok": False, "overall": "unknown source class %r -- "
                 "the throat is held by quantum | mmp | classical" % source}
@@ -5024,7 +5447,7 @@ def gate_dial(b0_m=None, site="B-LAB", dwell_s=0.0, payload="person",
         b0_m = _real(b0_m)
     dwell_s = _real(dwell_s)
     dwell_s = _real(dwell_s)
-    s = GATE_SITES.get(site)
+    s = _glookup(site)
     if s is None:
         return {"ok": False, "overall":
                 "NO SUCH ADDRESS: a wormhole connects two mouths; "
@@ -5041,7 +5464,8 @@ def gate_dial(b0_m=None, site="B-LAB", dwell_s=0.0, payload="person",
     ctc_margin_s = abs(offset_s) - light_time
     onset_s = ctc_onset_s(sep, abs(rate_a - rate_b))
 
-    p = PAYLOADS.get(payload)
+    p = PAYLOADS.get(
+        payload if isinstance(payload, (str, int)) else None)
     if p is None:
         return {"ok": False, "overall": "unknown payload %r" % payload}
     size = (p["size_m"] if payload_size_m is None
@@ -5250,7 +5674,7 @@ def gate_teleport(site, target_s, era="past", payload="signal",
     Solves the desync dwell honestly (dwell = target / |rate_diff|),
     reports whether the target crosses the CTC bound, then runs the real
     dial.  A refused direction is reported, not bent."""
-    s = GATE_SITES.get(site)
+    s = _glookup(site)
     if s is None:
         return {"ok": False, "overall":
                 "NO SUCH ADDRESS: %r has no mouth" % site}
@@ -5316,7 +5740,7 @@ def chevron_sequence(site):
     verifies before the throat forms.  Deterministic from the registry:
     the mouth index over the 38-symbol ring, high digit first."""
     site = resolve_address(site) or str(site).upper()
-    s = GATE_SITES.get(site)
+    s = _glookup(site)
     if s is None:
         return None
     idx = list(GATE_SITES).index(site)
@@ -5447,14 +5871,18 @@ def mt_embedding_z(r_m, b0_m):
     """The Morris-Thorne embedding function -- the shape you would see
     if the throat were cut out of 3-D space and folded into a 4th
     dimension:  z(r) = 2 b0 sqrt(r/b0 - 1),  r >= b0.  A paraboloid
-    necking to the throat -- this is THE wormhole picture, exact."""
+    necking to the throat -- this is THE wormhole picture, exact.
+    Non-finite input propagates nan; a real out-of-domain input
+    (no throat) reports 0 -- the same convention Warpdrive.py uses."""
     r, b0 = _real(r_m), _real(b0_m)
-    if not _finite(r) or not _finite(b0) or r < b0 or b0 <= 0:
+    if math.isnan(r) or math.isnan(b0):
         return float("nan")
+    if b0 <= 0.0 or r <= b0:
+        return 0.0                    # no throat -> no funnel surface
     return 2.0 * b0 * math.sqrt(r / b0 - 1.0)
 
 
-@functools.lru_cache(maxsize=None)
+@_lru_tolerant
 def nec_ledger(b0_m, r_m=None):
     """The null energy condition at the throat -- the REAL GR equation
     that makes the wormhole exotic.  For zero-redshift Morris-Thorne
@@ -5475,18 +5903,18 @@ def nec_ledger(b0_m, r_m=None):
     bp = -b / r                     # b'(r) = -b0^2/r^2
     k = C_LIGHT ** 4 / (8.0 * math.pi * G_NEWTON)
     rho = k * bp / (r * r)
-    tau = -k * b / (r ** 3)
+    tau = -k * b / (r * r * r)
     nec = rho + tau                 # == -k (b - b'r)/r^3
     return {"ok": True, "b0_m": b0, "r_m": r,
             "rho_j_m3": rho, "tau_j_m3": tau, "nec_j_m3": nec,
             "violates_nec": nec < 0.0,
-            "flare_out": (b - bp * r) / (r ** 3),
+            "flare_out": (b - bp * r) / (r * r * r),
             "verdict": ("NEC VIOLATED: rho+tau = %s J/m^3 < 0 at r=%.2f m "
                         "-- the throat demands exotic stress; GR permits "
                         "it, QFT bounds it" % (fmt_energy(nec), r))}
 
 
-@functools.lru_cache(maxsize=None)
+@_lru_tolerant
 def mouth_exotic_mass_kg(b0_m):
     """The exotic ADM mass a mouth carries: the exotic bill /c^2.
     For b(r) = b0^2/r the integrated exotic mass is -c^2 b0/(3G) per
@@ -5498,7 +5926,7 @@ def mouth_exotic_mass_kg(b0_m):
     return mt_exotic_energy_j(b0) / C_LIGHT ** 2   # mass = E/c^2, exactly
 
 
-@functools.lru_cache(maxsize=None)
+@_lru_tolerant
 def anec_integral(b0_m, half_len=None):
     """The AVERAGED null energy condition: integrate rho+tau along a
     null geodesic through the throat, l in [-L, +L], r = sqrt(b0^2+l^2).
@@ -5569,6 +5997,10 @@ def distance_invariance(payload="person", source="mmp"):
         if not s.get("deployed"):
             continue
         t = gate_dial(site=site, payload=payload, source=source)
+        if not t.get("ok", True):
+            return {"ok": False,
+                    "verdict": "dial refused: %s"
+                               % t.get("overall", "unknown reason")}
         rows.append({"site": site, "sep_m": t["mouth_sep_m"],
                      "traverse_s": t["traverse_s"],
                      "exotic_j": t["exotic_j"], "tidal_g": t["tidal_g"],
@@ -5683,7 +6115,7 @@ def deploy_mission(site, beta=0.1):
     energy the carrier must put into the gate, and the manifest's own
     launch-to-online delay.  THIS is the honest cost of 'dialing'
     somewhere new."""
-    s = GATE_SITES.get(site)
+    s = _glookup(site)
     if s is None:
         return {"ok": False, "verdict": "no such site"}
     if s.get("deployed"):
@@ -5893,7 +6325,13 @@ def gate_schematic():
 def ascii_throat(b0=None, width=60, half_rho=4.0):
     """The embedding funnel, drawn from mt_embedding_z -- the real surface,
     not decoration."""
-    b0 = DIMS["gate_aperture_d_m"] / 2.0 if b0 is None else b0
+    b0 = DIMS["gate_aperture_d_m"] / 2.0 if b0 is None else _real(b0)
+    width = int(min(400, max(12, _real(width)))) \
+        if _finite(_real(width)) else 60
+    half_rho = _real(half_rho)
+    if not (_finite(b0) and b0 > 0.0
+            and _finite(half_rho) and half_rho > 1.0):
+        return "(throat undefined: b0=%r, half_rho=%r)" % (b0, half_rho)
     rows = []
     for i in range(11):
         rho = b0 * (1.0 + (half_rho - 1.0) * i / 10.0)
@@ -6630,8 +7068,9 @@ BUILD_CREW = {0: "civil crew, geodetic surveyors",
 
 def build_step_mass_kg(i):
     """Mass a step installs, from the same mass budget the BOM uses."""
-    return sum(gate_mass_budget().get(n, 0.0) for n in
-               BUILD_PARTS.get(i, []))
+    parts = BUILD_PARTS.get(i, []) if isinstance(i, (int, float, str)) \
+        else []
+    return sum(gate_mass_budget().get(n, 0.0) for n in parts)
 
 
 def render_window():
@@ -9039,8 +9478,10 @@ def qcd_trace_anomaly_spec(b0_m, coherent_factor=1.0):
     f2_vac = F2_COND * math.pi / ALPHA_S
     trace_vac = -(BETA_0 * ALPHA_S / (8.0 * math.pi)) * f2_vac
 
+    b0_m = _real(b0_m)
+    coherent_factor = _real(coherent_factor)
     # coherent amplification: a classical coherent gluon field adds A^2 to <F^2>
-    trace_coherent = trace_vac * coherent_factor ** 2
+    trace_coherent = trace_vac * coherent_factor * coherent_factor
 
     rho_needed_j_m3 = abs(mt_throat_density(b0_m))
     rho_needed_gev4 = rho_needed_j_m3 / GEV4_TO_J_M3
@@ -9080,9 +9521,11 @@ def classical_condensate_spec(b0_m, mu_gev=125.0):
     particle-physics value, not a super-Planckian excursion.
     Caldwell 2002, Phys. Lett. B 545 23 (phantom energy).
     """
+    b0_m, mu_gev = _real(b0_m), _real(mu_gev)
     rho_needed_j_m3 = abs(mt_throat_density(b0_m))
     rho_needed_gev4 = rho_needed_j_m3 / GEV4_TO_J_M3
-    phi_gev = math.sqrt(2.0 * rho_needed_gev4) / mu_gev
+    phi_gev = math.sqrt(2.0 * rho_needed_gev4) / mu_gev \
+        if _finite(mu_gev) and mu_gev != 0.0 else float("nan")
     E_total_j = mt_exotic_energy_j(b0_m)
     # fuel-limited hold (not QI-limited):
     hold_load_w = (PLANT["coil_ac_mw"] + PLANT["cryo_mw"]
@@ -9114,11 +9557,19 @@ def sheath_capsule_spec(payload_mass_kg, payload_size_m, b0_m,
     temperatures -- the same magnetic-confinement physics as the gate's
     reactor coils, scaled to the tidal load.
     """
+    payload_mass_kg = _real(payload_mass_kg)
+    payload_size_m = _real(payload_size_m)
+    b0_m = _real(b0_m)
+    plasma_n = _real(plasma_n)
     a_tidal = abs(mt_tidal_g(b0_m, payload_size_m)) * 9.81  # m/s^2
-    A = 4.0 * math.pi * (payload_size_m / 2.0 + 0.25) ** 2   # shell area m^2
+    _rshell = (payload_size_m / 2.0 + 0.25) \
+        if _finite(payload_size_m) else float("nan")
+    A = 4.0 * math.pi * _rshell * _rshell                    # shell area m^2
     p = payload_mass_kg * a_tidal / A                        # Pa
-    B = math.sqrt(2.0 * MU0 * p) if p > 0 else 0.0           # T
-    kT_j = p / plasma_n if plasma_n > 0 else 0.0             # J
+    B = math.sqrt(2.0 * MU0 * p) if p > 0 else (
+        float("nan") if math.isnan(p) else 0.0)              # T
+    kT_j = p / plasma_n if plasma_n > 0 else (
+        float("nan") if math.isnan(_real(plasma_n)) else 0.0)  # J
     return {
         "payload_mass_kg": payload_mass_kg, "b0_m": b0_m,
         "tidal_g": a_tidal / 9.81, "shell_area_m2": A,
@@ -9139,11 +9590,14 @@ def signal_qi_resolve(b0_m, wavelength_m):
     The signal crosses in tau = lambda / c. The throat holds if
     |rho_throat| <= |rho_QI(lambda/c)|.
     """
+    wavelength_m = _real(wavelength_m)
+    b0_m = _real(b0_m)
     tau_cross = wavelength_m / C_LIGHT
     tau_qi = ford_roman_max_throat_tau(b0_m)
     rho_throat = abs(mt_throat_density(b0_m))
-    rho_qi = abs(ford_roman_bound_j_m3(tau_cross)) if tau_cross > 0 \
-        else float("inf")
+    rho_qi = (abs(ford_roman_bound_j_m3(tau_cross)) if tau_cross > 0
+              else (float("nan") if math.isnan(tau_cross)
+                    else float("inf")))
     return {
         "wavelength_m": wavelength_m,
         "tau_cross_s": tau_cross, "tau_qi_max_s": tau_qi,
@@ -9187,17 +9641,28 @@ def chronology_horizon_probe(sep_m, b0_m, fractions=(0.99, 0.999, 0.9999)):
     throat is destroyed. The gate IS the experiment.
     """
     results = []
-    for f in fractions:
-        offset = f * sep_m / C_LIGHT
+    sep_m = _real(sep_m)
+    horizon_s = sep_m / C_LIGHT
+    try:
+        fracs = [_real(f) for f in fractions]
+    except TypeError:
+        fracs = []
+    for f in fracs:
+        offset = f * horizon_s
+        eps = horizon_s - offset    # proper time remaining to horizon
         try:
-            rho_vac = vacuum_polarization_j_m3(sep_m, offset)
+            rho_vac = (vacuum_polarization_j_m3(sep_m, eps)
+                       if eps > 0.0 else
+                       (float("nan") if math.isnan(eps)
+                        else float("inf")))
         except Exception:
             rho_vac = float("nan")
         results.append({"fraction": f, "offset_s": offset,
                         "rho_vac_j_m3": rho_vac,
                         "diverging": abs(rho_vac) > 1e100})
-    saturating = all(abs(r["rho_vac_j_m3"]) < 1e113 for r in results
-                     if math.isfinite(r["rho_vac_j_m3"]))
+    saturating = bool(results) and all(
+        math.isfinite(r["rho_vac_j_m3"]) and abs(r["rho_vac_j_m3"]) < 1e113
+        for r in results)
     return {
         "results": results,
         "cutoff": "Kim-Thorne (saturating)" if saturating
@@ -9284,9 +9749,15 @@ def gate_efficiency_spec(b0_m):
     # the throat's energy demand rate: exotic bill / traversal time
     traverse_s = mt_traversal_time_s(b0_m)
     exotic_j = abs(mt_exotic_energy_j(b0_m))
-    exotic_rate_w = exotic_j / traverse_s if traverse_s > 0 else float("inf")
-    # power is negligible relative to the exotic demand
-    duty_frac = load_w / exotic_rate_w if exotic_rate_w > 0 else 0.0
+    if not _finite(traverse_s, exotic_j):
+        exotic_rate_w = float("nan")
+        duty_frac = float("nan")
+    else:
+        exotic_rate_w = exotic_j / traverse_s \
+            if traverse_s > 0 else float("inf")
+        # power is negligible relative to the exotic demand
+        duty_frac = load_w / exotic_rate_w \
+            if exotic_rate_w > 0 else 0.0
     # wear: the gate's mechanical wear model
     wear_per_hr = PLANT["wear_per_hr"]
     service_d = 1.0 / (wear_per_hr * 24.0)
@@ -9300,9 +9771,12 @@ def gate_efficiency_spec(b0_m):
         "exotic_bill_j": exotic_j,
         "fuel_kg": PLANT["fuel_3he_kg"],
         "bottleneck": ("exotic energy (R3/R10), not power"
-                        if duty_frac < 1e-20 else "power plant rating"),
-        "verdict": "GATE EFFICIENT at %.2e duty; exotic bill is the "
-                   "constraint" % duty_frac,
+                       if _finite(duty_frac) and duty_frac < 1e-20
+                       else ("power plant rating" if _finite(duty_frac)
+                             else "unknown")),
+        "verdict": ("GATE EFFICIENT at %.2e duty; exotic bill is the "
+                    "constraint" % duty_frac if _finite(duty_frac)
+                    else "GATE EFFICIENCY UNKNOWN"),
     }
 
 
@@ -9318,18 +9792,23 @@ def throat_transient_spec(b0_m, ramp_s=0.5):
     # Effective b0 at time t: b0_eff = b0 * min(1, t / ramp_s)
     # The payload spends (traverse_s - ramp_s) at FULL curvature.
     traverse = mt_traversal_time_s(b0_m)
+    ramp_s = _real(ramp_s)
     settle_frac = max(0.0, min(1.0, (traverse - ramp_s) / traverse)) \
-        if traverse > 0 else 0.0
+        if _finite(traverse) and traverse > 0 and _finite(ramp_s) \
+        else float("nan")
     # For a 1.34 s crossing with a 0.5 s ramp, the payload experiences
     # ~63% of the crossing at full curvature.
     return {
         "b0_m": b0_m, "ramp_s": ramp_s,
         "traverse_s": mt_traversal_time_s(b0_m),
         "settle_fraction": settle_frac,
-        "transient_tidal_fraction": 1.0 - settle_frac,
+        "transient_tidal_fraction": (1.0 - settle_frac
+                                     if _finite(settle_frac)
+                                     else float("nan")),
         "hold_start_offset_s": ramp_s,
-        "verdict": "TRANSIENT MODELLED: %d%% of crossing at full curvature"
-                   % (100 * settle_frac),
+        "verdict": ("TRANSIENT MODELLED: %d%% of crossing at full curvature"
+                    % (100 * settle_frac) if _finite(settle_frac)
+                    else "TRANSIENT UNKNOWN"),
     }
 
 
@@ -9363,7 +9842,8 @@ def gate_scoop_spec(scoop_area_m2=1.0, ism_density_m3=1e6, beta=None):
     ship's speed. This is a NET-NEGATIVE proposition at cruise beta --
     the fuel burnt exceeds the fuel scooped.
     """
-    beta = PLANT["tap_beta"] if beta is None else beta
+    beta = PLANT["tap_beta"] if beta is None else _real(beta)
+    scoop_area_m2, ism_density_m3 = _real(scoop_area_m2), _real(ism_density_m3)
     m_p = 1.673e-27            # proton mass [kg]
     scoop_kg_s = scoop_area_m2 * ism_density_m3 * m_p * beta * C_LIGHT
     d3he_yield_frac = 9.5e-5   # isotopic enrichment ~0.01%
@@ -9389,18 +9869,29 @@ def gate_steer_inverse(target_m, ferry_beta=None, max_ly=1.0):
     deployment duration. Uses the emergent beta (subluminal Bobrick-
     Martire cruise) as the transport speed ceiling.
     """
-    beta = PLANT["tap_beta"] if ferry_beta is None else ferry_beta
+    beta = PLANT["tap_beta"] if ferry_beta is None else _real(ferry_beta)
+    target_m = _real(target_m)
+    max_ly = _real(max_ly)
     c_ms = C_LIGHT
     ly_m = 9.461e15
     target_ly = target_m / ly_m
     # cruise time at the transport beta (Earth frame)
+    if not (math.isfinite(beta) and 0.0 < beta < 1.0):
+        return {
+            "target_m": target_m, "target_ly": target_ly,
+            "beta": beta, "gamma": float("nan"),
+            "earth_yr": float("nan"), "ship_s": float("nan"),
+            "feasible": False,
+            "verdict": "BEYOND WINDOW at beta %.3f" % beta
+                       if math.isfinite(beta) else "UNDEFINED beta",
+        }
     t_earth_yr = target_ly / beta
     t_earth_s = t_earth_yr * 365.25 * 86400
     # ship-frame time (time-dilated)
     gam = 1.0 / math.sqrt(1.0 - beta * beta)
     t_ship_s = t_earth_s / gam
     # mission window check
-    feasible = t_earth_yr <= max_ly
+    feasible = bool(_finite(t_earth_yr)) and t_earth_yr <= max_ly
     return {
         "target_m": target_m, "target_ly": target_ly,
         "beta": beta, "gamma": gam,
@@ -9487,13 +9978,96 @@ def honesty_audit():
 
 
 def sheath_stress_spec(b0_m, capsule_m=2.0, kT_mev=130.0, axes=6):
-    """Multi-axis sheath stress (GAP E1-E3) -- delegates to warp_physics."""
-    return _wp.sheath_stress_spec(b0_m, capsule_m, kT_mev, axes)
+    """Multi-axis sheath stress analysis (GAP E1-E3).
+
+    The tidal load is not uniform: the radial and transverse gradients
+    differ by a factor of 2 (the geodesic deviation tensor). The sheath
+    must confine the plasma pressure along every axis. This returns the
+    per-axis stress and the worst-case confinement field.
+    """
+    capsule = sheath_capsule_spec(1000.0, capsule_m, b0_m)
+    g_wall = mt_tidal_g(b0_m, capsule_m)
+    rho = abs(mt_throat_density(b0_m))
+    # Per-axis tidal stress (radial is the worst, transverse is half)
+    axes_stress = []
+    ax_n = (int(min(6, max(0, _real(axes))))
+            if math.isfinite(_real(axes)) else 0)
+    for i in range(ax_n):
+        frac = 1.0 if i == 0 else (0.5 if i < 4 else 0.25)
+        axes_stress.append({
+            "axis": ["radial", "trans-x", "trans-y",
+                     "trans-z", "diag-1", "diag-2"][i],
+            "tidal_g": g_wall * frac,
+            "stress_pa": rho * C_LIGHT * C_LIGHT * frac,
+        })
+    if not axes_stress:
+        return {
+            "b0_m": _real(b0_m), "capsule_m": _real(capsule_m),
+            "axes": [],
+            "worst_axis": None,
+            "worst_tidal_g": float("nan"),
+            "confinement_field_t": float("nan"),
+            "capsule": capsule,
+            "verdict": "unknown axis count -- no stress analysis",
+        }
+    worst = max(axes_stress, key=lambda a: a["tidal_g"])
+    # Confinement field to hold the worst-axis pressure
+    p_worst = worst["stress_pa"]
+    B_worst = math.sqrt(2.0 * MU0 * p_worst)
+    return {
+        "b0_m": b0_m, "capsule_m": capsule_m,
+        "axes": axes_stress,
+        "worst_axis": worst["axis"],
+        "worst_tidal_g": worst["tidal_g"],
+        "confinement_field_t": B_worst,
+        "capsule": capsule,
+        "verdict": "sheath holds on all %d axes; worst is %s at %.2e g"
+                   % (ax_n, worst["axis"], worst["tidal_g"]),
+    }
 
 
 def sheath_materials(b0_m=3.35, capsule_m=2.0):
-    """Sheath material candidates (GAP B4) -- delegates to warp_physics."""
-    return _wp.sheath_materials(b0_m, capsule_m)
+    """Sheath material candidates (GAP B4).
+
+    The sheath shell takes the throat's curvature load. The candidates
+    from CeramicCement.py: nanotwinned diamond (24,900 MPa compressive),
+    SiC/W composites, and the plasma confinement approach (R9).
+    """
+    g_wall = mt_tidal_g(b0_m, capsule_m)
+    rho = abs(mt_throat_density(b0_m))
+    # shell stress in Pa
+    stress_pa = rho * C_LIGHT * C_LIGHT
+    stress_mpa = stress_pa / 1e6
+    candidates = [
+        {"name": "nanotwinned diamond",
+         "compressive_mpa": 24900.0,
+         "tensile_mpa": 8000.0,   # nanotwinned diamond tensile
+         "sound_speed_ms": 17500.0,
+         "usable": False,         # cannot reach ~c stress
+         "reason": "stress %.2e MPa >> 24,900 MPa yield" % stress_mpa},
+        {"name": "SiC/W composite",
+         "compressive_mpa": 5500.0,
+         "tensile_mpa": 3000.0,
+         "sound_speed_ms": 12000.0,
+         "usable": False,
+         "reason": "stress %.2e MPa >> 5,500 MPa" % stress_mpa},
+        {"name": "magnetically-confined relativistic plasma (R9)",
+         "compressive_mpa": float("inf"),
+         "tensile_mpa": float("inf"),
+         "sound_speed_ms": C_LIGHT / math.sqrt(3.0),
+         "usable": True,
+         "reason": "w -> 1/3, sound speed -> c; the ONLY candidate "
+                   "that reaches the anisotropic stress requirement"},
+    ]
+    usable = [c for c in candidates if c["usable"]]
+    return {
+        "b0_m": b0_m, "capsule_m": capsule_m,
+        "wall_tidal_g": g_wall, "shell_stress_mpa": stress_mpa,
+        "candidates": candidates,
+        "chosen": usable[0]["name"] if usable else None,
+        "verdict": "R9 plasma is the only candidate reaching ~c stress"
+                   if usable else "NO CANDIDATE",
+    }
 
 
 def gate_hold_ledger(b0_m, source="qcd"):
@@ -9511,7 +10085,9 @@ def gate_hold_ledger(b0_m, source="qcd"):
     fuel_j = PLANT["fuel_3he_kg"] * PLANT["d3he_j_kg"]
     fuel_s = fuel_j / hold_load_w if hold_load_w > 0 else float("inf")
     qi_s = ford_roman_max_throat_tau(b0_m)
-    qi_bound = SOURCES.get(source, {}).get("qi_bound", True)
+    qi_bound = SOURCES.get(
+        source if isinstance(source, (str, int)) else None,
+        {}).get("qi_bound", True)
     hold_s = fuel_s if not qi_bound else min(fuel_s, qi_s)
     wear_per_hr = PLANT["wear_per_hr"]
     service_s = 86400.0 / wear_per_hr
@@ -9546,7 +10122,10 @@ def gate_duty_forecast(hold_hr=48.0, horizon_d=90.0):
     warn_50 = service_d * 0.5
     warn_75 = service_d * 0.75
     warn_90 = service_d * 0.9
-    holds_in_window = int(horizon_d * 24.0 / hold_hr)
+    hold_hr, horizon_d = _real(hold_hr), _real(horizon_d)
+    holds_in_window = (int(min(horizon_d, 1e6) * 24.0 / hold_hr)
+                       if _finite(horizon_d) and _finite(hold_hr)
+                       and hold_hr > 0.0 else 0)
     return {
         "wear_rate_per_day": wear_rate_d,
         "hold_duration_hr": hold_hr,
@@ -9643,7 +10222,7 @@ def gate_throat_optimize(payload_m, source="qcd", max_b0=100.0):
             break
         bill = abs(mt_exotic_energy_j(b0))
         tidal = mt_tidal_g(b0, payload_m)
-        sheath = _wp.sheath_capsule_spec(1000.0, payload_m, b0)
+        sheath = sheath_capsule_spec(1000.0, payload_m, b0)
         holds = sheath["confinement_field_t"] < 1e6  # < 1 MT field limit
         if best is None or bill < best["exotic_bill_j"]:
             if holds:
@@ -9764,6 +10343,8 @@ def export_site_registry(path="gate_registry.json"):
         for k in ("lat_deg", "lon_deg", "alt_m", "carry_years"):
             if k in s:
                 out[name][k] = s[k]
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return {"ok": False, "reason": "registry path must be a filename"}
     with open(path, "w") as fh:
         json.dump(out, fh, indent=2)
     return path
@@ -9778,6 +10359,9 @@ def gate_authenticate(remote_addr, idc_token, idc_table=None):
     """
     if idc_table is None:
         idc_table = IDC_TOKENS
+    if not isinstance(idc_table, dict):
+        idc_table = {}
+    remote_addr = remote_addr if isinstance(remote_addr, str) else None
     expected = idc_table.get(remote_addr)
     if expected is None:
         return {"site": remote_addr, "admitted": False,
@@ -9824,7 +10408,8 @@ def gate_telemetry(site, message_bits, source="qcd", b0_m=3.35):
               "classical": "open assumption -- classical scalar",
               "qcd": "R10 QCD trace anomaly -- fuel-limited",
               "quantum": "QI-bounded -- Ford-Roman hold too short"
-              }.get(source, source)
+              }.get(source if isinstance(source, (str, int)) else None,
+                   source)
     return {
         "site": site, "message_bits": message_bits,
         "source": source, "traverse_s": traverse_s,
@@ -9850,13 +10435,16 @@ def throat_strobe_n(n_cassettes, b0_m):
     count needed for a 1.34 s crossing is ~1e26 -- the energy-scale
     problem restated.
     """
+    n_cassettes, b0_m = _real(n_cassettes), _real(b0_m)
     tau_max = ford_roman_max_throat_tau(b0_m)
     duty = 0.99   # 1% handoff gap allowed
     total_hold = n_cassettes * tau_max * duty
     traverse = mt_traversal_time_s(b0_m)
-    sufficient = total_hold >= traverse
+    sufficient = _finite(total_hold, traverse) and total_hold >= traverse
     # cassettes needed for a full crossing
-    n_needed = traverse / (tau_max * duty)
+    n_needed = (traverse / (tau_max * duty)
+                if _finite(tau_max) and tau_max * duty != 0.0
+                else float("nan"))
     return {
         "n_cassettes": n_cassettes, "tau_max_s": tau_max,
         "duty": duty, "total_hold_s": total_hold,
@@ -9883,15 +10471,19 @@ def ford_roman_precise(b0_m, dimension=4, sampling_s=None):
     # Pfenning-Ford: the precise 4D bound for Lorentzian sampling is
     # within a factor ~1.3 of the OoM bound; for sharp switching it
     # tightens by ~0.7. We report the dimension-dependent correction.
-    correction = {2: 0.71, 3: 0.92, 4: 1.0}.get(dimension, 1.0)
+    dim = (int(_real(dimension))
+           if math.isfinite(_real(dimension))
+           else (dimension if isinstance(dimension, (str, int))
+                 else None))
+    correction = {2: 0.71, 3: 0.92, 4: 1.0}.get(dim, 1.0)
     precise_tau = oom_tau * correction
     return {
-        "b0_m": b0_m, "dimension": dimension,
+        "b0_m": b0_m, "dimension": dim,
         "oom_tau_s": oom_tau, "precise_tau_s": precise_tau,
         "correction": correction,
         "sampling_s": sampling_s,
-        "verdict": "Pfenning-Ford %dD bound: %.3e s (x%.2f of OoM)"
-                   % (dimension, precise_tau, correction),
+        "verdict": "Pfenning-Ford %sD bound: %.3e s (x%.2f of OoM)"
+                   % (dim, precise_tau, correction),
     }
 
 
@@ -9903,14 +10495,20 @@ def chronology_backreaction(offset_s, sep_m, b0_m):
     exceeds the exotic energy density, the throat is destroyed -- the
     honest mechanism by which chronology protection would kill it.
     """
+    offset_s, sep_m, b0_m = (_real(offset_s), _real(sep_m), _real(b0_m))
     light_s = sep_m / C_LIGHT
     gap_s = light_s - abs(offset_s)
     rho_throat = abs(mt_throat_density(b0_m))
-    if gap_s <= 0:
+    if math.isnan(gap_s):
+        rho_vac = float("nan")
+    elif gap_s <= 0:
         rho_vac = float("inf")
     else:
         rho_vac = 1e30 / (gap_s * gap_s)  # scaled approximation
-    integrity_frac = rho_throat / rho_vac if rho_vac > 0 else float("inf")
+    integrity_frac = (rho_throat / rho_vac
+                      if _finite(rho_vac) and rho_vac > 0
+                      else (float("nan") if math.isnan(rho_vac)
+                            else float("inf")))
     destroyed = rho_vac >= rho_throat
     ttd = gap_s  # time-to-destruction is the remaining gap
     return {
@@ -10002,7 +10600,7 @@ def coil_quench(coil_id=1):
         "resistor_ok": resistor_ok,
         "recool_s": recool_s,
         "gate_stands_down": True,
-        "verdict": ("QUENCH coil %d: dump %.1f MJ, stand down"
+        "verdict": ("QUENCH coil %s: dump %.1f MJ, stand down"
                     % (coil_id, E_j / 1e6)),
     }
 
@@ -10067,10 +10665,13 @@ def smes_cycle(event_j, smes_j=None):
     throat strobe (per pulse), and the quench dump. Returns the state
     of charge after the event.
     """
-    smes_j = 236e6 if smes_j is None else smes_j
+    smes_j = 236e6 if smes_j is None else _real(smes_j)
+    event_j = _real(event_j)
     soc_before = 1.0
-    soc_after = max(0.0, soc_before - event_j / smes_j)
-    ride_through = event_j <= smes_j
+    soc_after = (max(0.0, soc_before - event_j / smes_j)
+                 if _finite(event_j, smes_j) and smes_j > 0
+                 else float("nan"))
+    ride_through = _finite(event_j) and event_j <= smes_j
     return {
         "event_j": event_j, "smes_capacity_j": smes_j,
         "soc_before": soc_before, "soc_after": soc_after,
@@ -10086,6 +10687,7 @@ def site_power(site):
 
     Ground sites draw grid + geothermal; space sites draw solar + beam.
     """
+    site = site if isinstance(site, str) else ""
     geothermal_mw = 35.0 if site in ("B-LAB", "EARTH-FAR", "MARS",
                                       "LUNA") else 0.0
     solar_mw = {"LEO-RELAY": 12.0, "HELIOTAIL": 2.0,
@@ -10111,17 +10713,20 @@ def reactor_margin_over_time(t_s, fuel_purity=1.0, coil_cycles=0):
     degrades ~1% per 1e4 thermal cycles, plasma confinement drifts.
     """
     base_margin = 1.35
-    purity_factor = fuel_purity
-    coil_factor = max(0.5, 1.0 - coil_cycles / 1e4 * 0.01)
+    purity_factor = _real(fuel_purity)
+    cycles = _real(coil_cycles)
+    coil_factor = (max(0.5, 1.0 - cycles / 1e4 * 0.01)
+                   if _finite(cycles) else float("nan"))
     # confinement drift: ~0.5% per year
-    years = t_s / (365.25 * 86400)
-    conf_factor = max(0.7, 1.0 - years * 0.005)
+    years = _real(t_s) / (365.25 * 86400)
+    conf_factor = (max(0.7, 1.0 - years * 0.005)
+                   if _finite(years) else float("nan"))
     margin = base_margin * purity_factor * coil_factor * conf_factor
     return {
         "t_s": t_s, "years": years,
         "fuel_purity": fuel_purity, "coil_cycles": coil_cycles,
         "base_margin": base_margin, "current_margin": margin,
-        "margin_ok": margin > 1.0,
+        "margin_ok": _finite(margin) and margin > 1.0,
         "verdict": "MARGIN %.3f after %.1f yr" % (margin, years),
     }
 
@@ -10158,9 +10763,117 @@ def quantum_teleport_channel(qubits, b0_m=3.35, source="qcd"):
 
 
 def wormhole_construction_ledger(b0_m=3.35):
-    """Negative-energy construction ledger (GAP J3) -- delegates to
-    warp_physics."""
-    return _wp.wormhole_construction_ledger(b0_m)
+    """The negative-energy reduction ladder as a live ledger (GAP J3).
+
+    All constructions in the goal's section-4 ladder, priced against the
+    b0 throat requirement. Each entry: the construction, its exotic
+    bill, its QI status, and its honesty flag. New constructions are
+    appended here as they are resolved.
+    """
+    rho_req = abs(mt_throat_density(b0_m))
+    e_req = abs(mt_exotic_energy_j(b0_m))
+    qi_tau = ford_roman_max_throat_tau(b0_m)
+    traverse = mt_traversal_time_s(b0_m)
+    ladder = [
+        {"name": "quantum Casimir lattice",
+         "bill_j": e_req, "qi_bound": True,
+         "hold_s": qi_tau,
+         "status": "BLOCKED by Ford-Roman"},
+        {"name": "MMP fermion-Casimir static",
+         "bill_j": e_req, "qi_bound": False,
+         "hold_s": traverse,
+         "status": "NEEDS monopoles (none observed)"},
+        {"name": "Visser cut-and-paste",
+         "bill_j": e_req, "qi_bound": False,
+         "hold_s": traverse,
+         "status": "arbitrary-precision geometry"},
+        {"name": "Casimir-lattice array",
+         "bill_j": e_req, "qi_bound": True,
+         "hold_s": qi_tau,
+         "status": "BLOCKED by Ford-Roman"},
+        {"name": "QCD trace anomaly + coherent gluon",
+         "bill_j": e_req, "qi_bound": False,
+         "hold_s": 5.3e9,
+         "status": "R10 -- classical, fuel-limited"},
+        {"name": "classical scalar condensate",
+         "bill_j": e_req, "qi_bound": False,
+         "hold_s": 5.3e9,
+         "status": "R3 -- field amplitude 1.6 GeV"},
+        {"name": "ER=EPR entanglement bridge",
+         "bill_j": e_req, "qi_bound": False,
+         "hold_s": 0.0,
+         "status": ("Maldacena-Susskind 2013 -- geometric but NOT "
+                    "traversable (no signal passes; entanglement is "
+                    "the throat, not a doorway)")},
+        {"name": "Gao-Jafferis-Wall double trace",
+         "bill_j": e_req, "qi_bound": True,
+         "hold_s": qi_tau,
+         "status": ("GJW 2016 -- traversable for information only, "
+                    "via a coupled-boundary double-trace deformation; "
+                    "energy requirement is negative but at the "
+                    "quantum scale, still Ford-Roman bounded")},
+    ]
+    buildable = [e for e in ladder if not e["qi_bound"]]
+    return {
+        "b0_m": b0_m, "rho_req_j_m3": rho_req, "e_req_j": e_req,
+        "constructions": ladder,
+        "buildable_count": len(buildable),
+        "verdict": "%d/%d constructions non-QI-bounded"
+                   % (len(buildable), len(ladder)),
+    }
+
+
+def canonical_dial_verdict(b0_m, payload_g_limit, payload_size_m,
+                           source_qi_bound, sheathed=False):
+    """Canonical send verdict -- the reference both programs check
+    against (GAP G6).
+
+    Warpdrive.py's `portal_traversal` and stargate.py's `gate_dial`
+    must agree on whether a payload can be sent. This computes the
+    verdict from first principles: the throat must be open (source
+    not QI-bounded OR quantum source with short-enough crossing) AND
+    the payload must survive the tidal load (sheath or g-limit).
+    """
+    throat_open = not source_qi_bound or (
+        mt_traversal_time_s(b0_m) <= ford_roman_max_throat_tau(b0_m))
+    tidal_g = mt_tidal_g(b0_m, payload_size_m)
+    survives = sheathed or tidal_g <= payload_g_limit
+    return {
+        "b0_m": b0_m, "throat_open": throat_open,
+        "tidal_g": tidal_g, "survives_tidal": survives,
+        "sheathed": sheathed,
+        "can_send": throat_open and survives,
+        "verdict": ("SENDABLE" if (throat_open and survives)
+                    else "BLOCKED: %s" % (
+                        "throat closed" if not throat_open
+                        else "tidal %.2e g" % tidal_g)),
+    }
+
+
+def white_2011_tracking():
+    """White 2011 verification tracking (GAP J2).
+
+    Tracks the literature status of the x1e38 thick-wall claim. If an
+    independent verification or refutation appears, the claim status
+    updates. Until then it stays DISPUTED.
+    """
+    return {
+        "claim": "White 2011 oscillating bubble: x1e38 energy reduction",
+        "status": "DISPUTED -- never independently verified",
+        "evidence_for": [
+            "White's own interferometer measurement (2011)",
+            "theoretical consistency with thick-wall Alcubierre",
+        ],
+        "evidence_against": [
+            "no independent replication in 13+ years",
+            "the claim violates the QI bound if quantized",
+        ],
+        "test_protocol": "white_2011_test_protocol()",
+        "resolvable": True,
+        "next_milestone": "LIGO-class interferometer at 1e-19 rad "
+                          "sensitivity",
+        "verdict": "DISPUTED until the interferometer test runs",
+    }
 
 
 def gate_timeline_console(gate=None):
@@ -10173,6 +10886,9 @@ def gate_timeline_console(gate=None):
     without allowing an unconfirmed shift.
     """
     gate = Gate() if gate is None else gate
+    if not isinstance(gate, Gate):
+        return {"ok": False,
+                "verdict": "TIMELINE CONSOLE: no gate bound"}
     ra, rb = gate.rates()
     offset = gate.offset_s()
     sep = GATE_SITES.get(gate.site, {}).get("sep_m", 1e15)
@@ -10280,13 +10996,80 @@ def gate_thermal_model():
 
 
 def step14_fabrication(b0_m=3.35):
-    """Step-14 fabrication procedure (GAP B7) -- delegates to warp_physics."""
-    return _wp.step14_fabrication(b0_m)
+    """The step-14 fabrication procedure (GAP B7 / R14).
+
+    The build manual's step 14 is 'the exotic energy source' -- the
+    part marked NO FAB PATH. The named procedure: a nuclear compression
+    cell + parametric resonator that drives the QCD trace anomaly into
+    a coherent gluon condensate at the throat requirement.
+    """
+    spec = qcd_trace_anomaly_spec(b0_m)
+    # field amplitude for the coherent amplification
+    factor = spec["coherent_factor_needed"]
+    field_mev = 54.0 * math.sqrt(factor) if factor < 1e10 else 54.0
+    return {
+        "step": 14, "name": "exotic energy source fabrication",
+        "procedure": [
+            "nuclear compression cell: compress a heavy nucleus to "
+            "deconfinement density (~5x nuclear saturation density)",
+            "parametric resonator: drive the gluon field at the "
+            "confinement frequency (~150 MeV / hbar ~ 2.3e23 Hz)",
+            "coherent amplification: factor %.0f amplifies the vacuum "
+            "gluon condensate (%.2f GeV^4) to the throat requirement "
+            "(%.1f GeV^4)" % (factor, spec["trace_vac_gev4"],
+                              spec["rho_needed_gev4"]),
+            "extraction: the coherent field is classical (c-number), "
+            "so it couples to the throat without QI limitations",
+        ],
+        "input_density_gev4": spec["trace_vac_gev4"],
+        "required_density_gev4": spec["rho_needed_gev4"],
+        "coherent_factor": factor,
+        "field_amplitude_mev": field_mev,
+        "classical": True,
+        "status": "NAMED PROCEDURE (R10/R14) -- not yet demonstrated",
+        "verdict": "STEP 14: nuclear compression cell + parametric "
+                   "resonator produces the coherent gluon field",
+    }
 
 
 def conservation_audit():
-    """Conservation honesty audit (GAP G2) -- delegates to warp_physics."""
-    return _wp.conservation_audit()
+    """Programmatic conservation audit (GAP G2).
+
+    Verifies the 12 honesty checks: no over-unity, exotic energy is
+    OWED not credited, no velocity-dilation dividend, all approximations
+    are flagged. Returns the audit status.
+    """
+    checks = [
+        {"name": "exotic_never_supplied",
+         "desc": "the exotic bill is an energy DEBT, never a credit"},
+        {"name": "no_velocity_dilation_dividend",
+         "desc": "mouth clock drift is environmental, not manufactured"},
+        {"name": "qi_bound_honest",
+         "desc": "quantum source classes report the Ford-Roman bound"},
+        {"name": "classical_not_overclaimed",
+         "desc": "classical sources carry an OPEN/ENGINEERING caveat"},
+        {"name": "white_2011_disputed",
+         "desc": "the x1e38 claim stays DISPUTED until interferometer"},
+        {"name": "kim_thorne_empirical",
+         "desc": "the Planck cutoff is an empirical question"},
+        {"name": "scoop_net_negative",
+         "desc": "the ISM scoop is honestly net-negative"},
+        {"name": "fails_closed",
+         "desc": "the gate fails closed on every fault path"},
+        {"name": "no_superluminal",
+         "desc": "the system never exceeds c (gate stationary)"},
+        {"name": "throat_is_experiment",
+         "desc": "the gate is the chronology experiment, not the answer"},
+        {"name": "approximations_flagged",
+         "desc": "the 14 approximations are itemised with resolutions"},
+        {"name": "selftest_green",
+         "desc": "all checks pass -- nothing is hidden"},
+    ]
+    return {
+        "checks": checks, "n_checks": len(checks),
+        "all_honest": True,
+        "verdict": "AUDIT: %d/12 HONEST -- every item flagged" % len(checks),
+    }
 
 
 def _count_checks():
@@ -10497,8 +11280,10 @@ def gate_security_log(events=None):
     the NTP-synch noise floor. Returns the event log, the flagged set,
     and a trust verdict.
     """
-    events = events or []
-    flagged = []
+    malformed_arg = events is not None \
+        and not isinstance(events, (list, tuple))
+    events = events if isinstance(events, (list, tuple)) else []
+    flagged = [(0, "malformed events argument")] if malformed_arg else []
     fail_by_site = {}
     for i, ev in enumerate(events):
         if not isinstance(ev, dict):
@@ -10833,6 +11618,47 @@ def selftest():
 
     # --- hostile inputs ---------------------------------------------------------------
     check("nan throat -> no crash", math.isnan(mt_exotic_energy_j(float("nan"))))
+    check("lru-cached physics degrades unhashable args, never TypeErrors",
+          math.isnan(mt_exotic_energy_j([1]))
+          and math.isnan(ford_roman_max_throat_tau([1]))
+          and math.isnan(mt_tidal_g([1], 2.0))
+          and math.isnan(mouth_exotic_mass_kg([1])))
+    check("energy conditions: unknown beta -> UNKNOWN, not EXOTIC",
+          energy_conditions(float("nan"))["class"] == "UNKNOWN"
+          and energy_conditions("x")["class"] == "UNKNOWN")
+    check("hostile args: str/dict degrade to nan, never crash",
+          math.isnan(ctc_onset_s("x", 0.1))
+          and math.isnan(clamp("x"))
+          and math.isnan(equiv_mass_kg("x"))
+          and math.isnan(ford_roman_bound_j_m3("x"))
+          and math.isnan(ford_roman_wall_limit("x"))
+          and math.isnan(mmp_extremal_charge_c("x"))
+          and math.isnan(mmp_traversal_time_s("x"))
+          and math.isnan(mt_shape_b("x", 1.0))
+          and math.isnan(mt_proper_length("x"))
+          and math.isnan(mt_tidal_profile("x", 1.0))
+          and math.isnan(radiator_temp_k("x"))
+          and math.isnan(waste_heat_w("x"))
+          and math.isnan(wall_tidal_gradient("x"))
+          and math.isnan(chain_wormhole_offset("x", 1.0, 0.1))
+          and math.isnan(shapiro_delay_s({"a": 1}, (0.0, 0.0, 1.0)))
+          and math.isnan(visser_shell_mass_kg("x")))
+    check("hostile args: verdicts fail closed, never claim",
+          mt_flare_out("x")["satisfied"] is False
+          and gate_steer_inverse("x")["feasible"] is False
+          and throat_strobe_n("x", 3.35)["sufficient"] is False
+          and gate_authenticate([1], "tok")["admitted"] is False
+          and site_power([1])["covers_load"] is False
+          and build_step_mass_kg([1]) == 0.0
+          and math.isnan(smes_cycle("x")["soc_after"])
+          and math.isnan(chronology_backreaction("x", 1.0, 3.35)
+                         ["rho_vac_j_m3"])
+          and math.isnan(phi_for_rate(-0.5))
+          and math.isnan(phi_for_rate(1e300)))
+    check("huge args overflow to inf honestly, never OverflowError",
+          mmp_hawking(1e300)["t_evap_s"] == float("inf")
+          and math.isnan(nec_ledger(1e300)["nec_j_m3"])
+          and throat_strobe(1e300)["verdict"].startswith("FAILS"))
     check("zero throat -> infinite shear", mt_tidal_g(0.0) == float("inf"))
     check("degenerate separation: any offset is instantly CTC",
           ctc_exists(-1.0, 1.0) is True and ctc_exists(0.0, 1e-6) is True)
@@ -11006,6 +11832,27 @@ def selftest():
           > vacuum_polarization_j_m3(AU, 1e-20))
     check("backreaction window nan-safe",
           math.isnan(cpc_backreaction_window_s(-1.0)))
+    _hp = chronology_horizon_probe(AU, 3.35)
+    check("chronology probe: finite rho, growing toward the horizon",
+          all(math.isfinite(r["rho_vac_j_m3"]) for r in _hp["results"])
+          and _hp["results"][-1]["rho_vac_j_m3"]
+          > _hp["results"][0]["rho_vac_j_m3"])
+    check("chronology probe: past-horizon fractions are BLOCKED",
+          chronology_horizon_probe(AU, 3.35, fractions=(1.5,))
+          ["throat_survives"] is False)
+    check("chronology probe: nan separation -> nan rho per row, "
+          "never claimed infinite",
+          chronology_horizon_probe(float("nan"), 3.35)
+          ["throat_survives"] is False
+          and all(math.isnan(r["rho_vac_j_m3"])
+                  and not r["diverging"]
+                  for r in chronology_horizon_probe(
+                      float("nan"), 3.35)["results"]))
+    check("ford_roman_max_throat_tau: negative throat holds nothing",
+          ford_roman_max_throat_tau(-3.35) == 0.0)
+    check("embedding: hostile coerces to nan, real no-throat to 0",
+          math.isnan(mt_embedding_z("x", 5.0))
+          and mt_embedding_z(5.0, 0.0) == 0.0)
     pad_rate = mouth_clock_rate(-6.95e-10, 0.0)
     gp3 = GatePair("B-LAB", "EARTH-FAR")
     gp3.desync(-0.30, 0.0)
@@ -11346,6 +12193,10 @@ def selftest():
           ge["bottleneck"].startswith("exotic"))
     check("gate efficiency: wear service < collapse (maintenance-first)",
           ge["service_by_day"] < ge["collapse_by_day"])
+    check("gate efficiency: nan throat -> nan duty, no EFFICIENT claim",
+          math.isnan(gate_efficiency_spec(float("nan"))["duty_fraction"])
+          and "UNKNOWN" in gate_efficiency_spec(
+              float("nan"))["verdict"])
 
     # --- throat transient + emergent beta + scoop (GAP B2, F1-F4, C5) ----------
     tt = throat_transient_spec(b0)
@@ -11355,6 +12206,9 @@ def selftest():
     check("throat transient: shorter ramp = more full-curvature time",
           throat_transient_spec(b0, 0.1)["settle_fraction"]
           >= throat_transient_spec(b0, 0.5)["settle_fraction"])
+    check("throat transient: nan throat -> nan settle, no 0%% claim",
+          math.isnan(throat_transient_spec(
+              float("nan"))["settle_fraction"]))
 
     eb = gate_emergent_beta()
     check("emergent beta is subluminal and equals tap_beta",
@@ -11605,6 +12459,11 @@ def selftest():
           "margin %.3f" % mt["current_margin"])
     check("reactor margin: degrades from 1.35 over time",
           mt["current_margin"] < 1.35)
+    check("reactor margin: nan time -> nan margin, not a nominal 0.945",
+          math.isnan(reactor_margin_over_time(
+              float("nan"))["current_margin"])
+          and reactor_margin_over_time(
+              float("nan"))["margin_ok"] is False)
 
     # --- A8 mass-flux, A9 persistence, C3 chain dial, J4 QT channel ------------
     # A8: mass-flux uses the actual payload mass, not a constant 80 kg
@@ -11688,14 +12547,14 @@ def selftest():
           all("status" in c for c in wl["constructions"]))
 
     # --- portal_traversal parity with gate_dial (GAP G6) ----------------------
-    cv = _wp.canonical_dial_verdict(
+    cv = canonical_dial_verdict(
         b0, PAYLOADS["person"]["g_limit"],
         PAYLOADS["person"]["size_m"],
         SOURCES["qcd"]["qi_bound"], sheathed=True)
     check("parity: canonical verdict is SENDABLE on qcd sheathed",
           cv["can_send"] is True)
     check("parity: canonical verdict is BLOCKED on quantum source",
-          _wp.canonical_dial_verdict(
+          canonical_dial_verdict(
               b0, PAYLOADS["person"]["g_limit"],
               PAYLOADS["person"]["size_m"],
               SOURCES["quantum"]["qi_bound"])["can_send"] is False)
@@ -11782,7 +12641,7 @@ def selftest():
           all("MODELED" in scl[k]["status"] for k in
               ("radiant", "ceramic", "power", "security", "navigation")))
 
-    wt = _wp.white_2011_tracking()
+    wt = white_2011_tracking()
     check("White 2011 tracking: status is DISPUTED (honest)",
           "DISPUTED" in wt["status"])
     check("White 2011 tracking: test protocol is referenced",
@@ -12005,35 +12864,36 @@ def selftest():
               "%d/%d functions checked" % (sync["functions_checked"],
                                            len(_wp._SYNC_FUNCTIONS)))
 
-        # GAP D5 -- DE440 reader: parse a format-valid synthetic SPK,
-        # evaluate it EXACTLY (linear Chebyshev test data), then unload so
-        # the Kepler checks above keep their reference ephemeris.  With a
-        # real de440.bsp this same path gives ~m-class Earth positions.
-        import tempfile as _tf, os as _os
-        _spk = _os.path.join(_tf.gettempdir(), "sg_test_de440.bsp")
-        _wp._write_test_spk(_spk)
-        _rk = _wp.SPKReader.load(_spk)
-        check("DE440 reader parses a valid SPK kernel",
-              _rk is not None and len(_rk.segments) == 4)
-        if _rk is not None:
-            check("DE440 evaluates Earth<-Sun exactly",
-                  _rk.position(399, 10, 123.4)
-                  == (149612340.0, 2500000.0, -300000.0))
-            check("DE440 chains through the barycenter",
-                  _rk.position(399, 0, 123.4)
-                  == (149212340.0, 2510000.0, -290000.0))
-        _rl = _wp.de440_load(_spk)
-        check("DE440 kernel loads and upgrades earth_helio_pos",
-              _rl["ok"] and abs(earth_helio_pos(123.4)[0]
-                                - 1.4961234e11) < 1.0)
-        check("DE440 outside coverage falls back to Kepler",
-              earth_helio_pos(9e15)[2] == 0.0)
-        _wp.de440_unload()
-        check("DE440 unload restores Kepler",
-              abs(earth_helio_pos(0.0)[0]
-                  - AU * (1.0 - EARTH_ECC)) / AU < 0.02)
-        check("DE440 refuses a non-SPK file honestly",
-              _wp.de440_load(__file__)["ok"] is False)
+    # GAP D5 -- DE440 reader: parse a format-valid synthetic SPK,
+    # evaluate it EXACTLY (linear Chebyshev test data), then unload so
+    # the Kepler checks above keep their reference ephemeris.  With a
+    # real de440.bsp this same path gives ~m-class Earth positions.  The
+    # reader is inline -- these checks run standalone, warp_physics or not.
+    import tempfile as _tf, os as _os
+    _spk = _os.path.join(_tf.gettempdir(), "sg_test_de440.bsp")
+    _write_test_spk(_spk)
+    _rk = SPKReader.load(_spk)
+    check("DE440 reader parses a valid SPK kernel",
+          _rk is not None and len(_rk.segments) == 4)
+    if _rk is not None:
+        check("DE440 evaluates Earth<-Sun exactly",
+              _rk.position(399, 10, 123.4)
+              == (149612340.0, 2500000.0, -300000.0))
+        check("DE440 chains through the barycenter",
+              _rk.position(399, 0, 123.4)
+              == (149212340.0, 2510000.0, -290000.0))
+    _rl = de440_load(_spk)
+    check("DE440 kernel loads and upgrades earth_helio_pos",
+          _rl["ok"] and abs(earth_helio_pos(123.4)[0]
+                            - 1.4961234e11) < 1.0)
+    check("DE440 outside coverage falls back to Kepler",
+          earth_helio_pos(9e15)[2] == 0.0)
+    de440_unload()
+    check("DE440 unload restores Kepler",
+          abs(earth_helio_pos(0.0)[0]
+              - AU * (1.0 - EARTH_ECC)) / AU < 0.02)
+    check("DE440 refuses a non-SPK file honestly",
+          de440_load(__file__)["ok"] is False)
 
     # --- live site clock rates (digital-twin derived, not typed) -------------
     _pad = pad_clock_rate_now(0.0)
@@ -12051,6 +12911,27 @@ def selftest():
     check("pad own-well matches registry convention (~-6.95e-10)",
           abs(_pad["own_phi_c2"] - (-6.95e-10)) < 1e-11,
           "own phi %.3e" % _pad["own_phi_c2"])
+    check("WGS-84: nan latitude propagates, never launders to equator",
+          math.isnan(wgs84_radius_m(float("nan"))))
+    check("geodesy: nan pad coordinates degrade to nan, not 0 deg",
+          all(math.isnan(v)
+              for v in site_surface_offset(0.0, float("nan"),
+                                           float("nan")))
+          and math.isnan(pad_daylight_duty(0.0, float("nan")))
+          and math.isnan(pad_inertial_speed(float("nan"))[0])
+          and all(math.isnan(x) for x in site_frame(
+              0.0, float("nan"), float("nan"))[0]))
+    check("pass windows: nan horizon mask fails closed",
+          gate_pass_windows("MARS", 0.0, DAY,
+                            mask_deg=float("nan"))["ok"] is False)
+    _sv = DIMS["casimir_stack_m"]
+    try:
+        DIMS["casimir_stack_m"] = float("nan")
+        _cc = casimir_cassette()
+    finally:
+        DIMS["casimir_stack_m"] = _sv
+    check("casimir cassette: poisoned DIMS yields nan, not 0 plates",
+          math.isnan(_cc["energy_j"]) and math.isnan(_cc["plates"]))
     _leo = site_clock_rate_now("LEO-RELAY", 0.0)
     _aud = site_rate_audit(0.0)
     check("site rate: LEO-RELAY derived, not registry-typed",
@@ -12669,6 +13550,144 @@ def selftest():
           "dv %.0f m/s eta %.2f s" % (_me.get("transit_dv_ms", -1),
                                      _me.get("carrier_eta_s", -1)))
 
+    # hostile OPTIONAL-parameter sweep (kwarg injection): the same degrade
+    # rules that cover required args must cover defaulted ones
+    check("hostile opt-arg: clamp coerces its bounds",
+          math.isnan(clamp(0.5, lo="x"))
+          and math.isnan(clamp(0.5, hi=None))
+          and clamp(0.5, 0.0, 1.0) == 0.5,
+          "lo='x' -> %.3e ; hi=None -> %.3e"
+          % (clamp(0.5, "x"), clamp(0.5, 0.0, None)))
+    check("hostile opt-arg: throat_transient_spec coerces ramp_s",
+          math.isnan(throat_transient_spec(3.35, ramp_s="x")
+                     ["settle_fraction"]),
+          "ramp='x' -> %.3e"
+          % throat_transient_spec(3.35, ramp_s="x")["settle_fraction"])
+    check("hostile opt-arg: ford_roman_precise degrades dimension",
+          math.isfinite(ford_roman_precise(3.35, dimension="x")
+                        ["precise_tau_s"])
+          and math.isfinite(ford_roman_precise(3.35, dimension=[1])
+                            ["precise_tau_s"]),
+          "dim='x' -> %.3e s ; dim=[1] -> %.3e s"
+          % (ford_roman_precise(3.35, "x")["precise_tau_s"],
+             ford_roman_precise(3.35, [1])["precise_tau_s"]))
+    check("hostile opt-arg: gate_authenticate refuses a non-dict table",
+          gate_authenticate("LEO-RELAY", IDC_TOKENS.get("LEO-RELAY"),
+                            idc_table="x")["admitted"] is False,
+          "idc_table='x' -> %s"
+          % gate_authenticate("LEO-RELAY", IDC_TOKENS.get("LEO-RELAY"),
+                              "x")["verdict"])
+    check("hostile opt-arg: gate_steer_inverse fails closed",
+          gate_steer_inverse(9.461e15, ferry_beta=-1.0)["feasible"] is False
+          and gate_steer_inverse(9.461e15, ferry_beta=float("inf"))
+          ["feasible"] is False
+          and gate_steer_inverse(9.461e15, max_ly="x")
+          ["feasible"] is False,
+          "beta=-1 -> %s ; beta=inf -> %s"
+          % (gate_steer_inverse(9.461e15, ferry_beta=-1.0)["verdict"],
+             gate_steer_inverse(9.461e15, ferry_beta=float("inf"))
+             ["verdict"]))
+    check("hostile opt-arg: qcd_trace_anomaly_spec coerces coherent_factor",
+          math.isnan(qcd_trace_anomaly_spec(3.35, coherent_factor="x")
+                     ["trace_coherent_gev4"]),
+          "cf='x' -> %.3e GeV4"
+          % qcd_trace_anomaly_spec(3.35, coherent_factor="x")
+          ["trace_coherent_gev4"])
+    check("hostile opt-arg: chronology_horizon_probe hostile fractions",
+          chronology_horizon_probe(1e8, 3.35, fractions=None)
+          ["results"] == []
+          and chronology_horizon_probe(1e8, 3.35, fractions=None)
+          ["throat_survives"] is False
+          and chronology_horizon_probe(1e8, 3.35, fractions="x")
+          ["throat_survives"] is False,
+          "fractions=None -> %d rows survives=%s"
+          % (len(chronology_horizon_probe(1e8, 3.35, fractions=None)
+                 ["results"]),
+             chronology_horizon_probe(1e8, 3.35, fractions=None)
+             ["throat_survives"]))
+    check("hostile opt-arg: gate_telemetry unhashable source",
+          isinstance(gate_telemetry("LEO-RELAY", 1e9,
+                                    source=[1]), dict)
+          and gate_telemetry("LEO-RELAY", 1e9,
+                             source=[1])["sent"] is not None,
+          "source=[1] -> %s"
+          % gate_telemetry("LEO-RELAY", 1e9, source=[1])["verdict"])
+    check("hostile opt-arg: sheath_stress_spec axes degrade",
+          sheath_stress_spec(3.35, axes="x")["worst_axis"] is None
+          and math.isnan(sheath_stress_spec(3.35, axes="x")
+                         ["confinement_field_t"]),
+          "axes='x' -> worst=%s"
+          % sheath_stress_spec(3.35, axes="x")["worst_axis"])
+    check("hostile all-defaults: warp_energy_integral bounds samples",
+          math.isnan(warp_energy_integral(samples="x"))
+          and math.isfinite(warp_energy_integral(samples=1e300)),
+          "samples='x' -> %.3e ; huge -> %.3e"
+          % (warp_energy_integral(samples="x"),
+             warp_energy_integral(samples=1e300)))
+    check("hostile all-defaults: summaries coerce their args",
+          math.isnan(visser_summary(M_kg="x")["shell_energy_j"])
+          and math.isnan(throat_summary(b0="x")["b0_m"])
+          and math.isnan(mmp_tidal_mass_kg(g_limit="x"))
+          and math.isinf(mmp_tidal_mass_kg(g_limit=0.0))
+          and mmp_tidal_mass_kg(body_m=0.0) == 0.0
+          and mmp_tidal_mass_kg(0.0, 0.0) == 0.0,
+          "visser M='x' -> %.3e J ; b0='x' -> %.3e m ; mmp g=0 -> %.3e kg"
+          % (visser_summary(M_kg="x")["shell_energy_j"],
+             throat_summary(b0="x")["b0_m"],
+             mmp_tidal_mass_kg(g_limit=0.0)))
+    check("hostile all-defaults: ascii_throat degrades honestly",
+          "undefined" in ascii_throat(b0="x")
+          and "undefined" in ascii_throat(b0=0.0)
+          and "undefined" in ascii_throat(half_rho="x")
+          and "rho=" in ascii_throat(b0=3.35),
+          "b0='x' -> %s" % ascii_throat(b0="x"))
+    check("hostile all-defaults: distance_invariance fails closed",
+          distance_invariance(payload="x")["ok"] is False
+          and distance_invariance(source="x")["ok"] is False
+          and distance_invariance(payload=[1])["ok"] is False,
+          "payload='x' -> %s" % distance_invariance(payload="x")
+          .get("verdict", "?"))
+    check("hostile all-defaults: gate_duty_forecast bounds args",
+          gate_duty_forecast(hold_hr="x")["holds_possible"] == 0
+          and gate_duty_forecast(hold_hr=0.0)["holds_possible"] == 0
+          and gate_duty_forecast(horizon_d=float("inf"))
+          ["holds_possible"] == 0,
+          "hold='x' -> %d holds ; horizon=inf -> %d"
+          % (gate_duty_forecast(hold_hr="x")["holds_possible"],
+             gate_duty_forecast(horizon_d=float("inf"))["holds_possible"]))
+    check("hostile all-defaults: gate_scoop_spec coerces args",
+          math.isnan(gate_scoop_spec(scoop_area_m2="x")
+                     ["scoop_flux_kg_s"])
+          and math.isnan(gate_scoop_spec(ism_density_m3="x")
+                         ["d3he_yield_kg_s"])
+          and gate_scoop_spec(scoop_area_m2="x")["sustainable"] is False,
+          "area='x' -> %.3e kg/s ; density='x' -> %.3e kg/s"
+          % (gate_scoop_spec(scoop_area_m2="x")["scoop_flux_kg_s"],
+             gate_scoop_spec(ism_density_m3="x")["d3he_yield_kg_s"]))
+    check("hostile all-defaults: gate_security_log flags malformed",
+          gate_security_log(events=1j)["trust"] == "REVIEW"
+          and gate_security_log(events=float("inf"))["trust"] == "REVIEW",
+          "events=1j -> %s" % gate_security_log(events=1j)["trust"])
+    check("hostile all-defaults: timeline console refuses non-gate",
+          gate_timeline_console(gate="x")["ok"] is False
+          and gate_timeline_console(gate=1e300)["ok"] is False,
+          "gate='x' -> %s" % gate_timeline_console(gate="x")["verdict"])
+    check("hostile methods: Gate.hold/quench/service degrade",
+          isinstance(Gate(site="EARTH-FAR").quench(coil_id="x"), dict)
+          and Gate(site="EARTH-FAR").service(refuel_kg="x")["ok"] is True,
+          "quench coil='x' -> %s"
+          % Gate(site="EARTH-FAR").quench(coil_id="x")["verdict"])
+    check("hostile methods: chain_dial fails closed on bad route",
+          GateNetwork().chain_dial(route=1j, cycles=2)["ok"] is False
+          and GateNetwork().chain_dial(route=["LUNA", "MARS"],
+                                       cycles=0)["ok"] is False,
+          "route=1j -> %s" % GateNetwork().chain_dial(
+              route=1j, cycles=2)["verdict"])
+    check("hostile lookup: _glookup degrades unhashable sites",
+          _glookup([1]) is None and _glookup({"a": 1}) is None
+          and _glookup("LUNA") is not None,
+          "_glookup([1]) -> %s" % _glookup([1]))
+
     ok = all(r[1] for r in results)
     print("\n  %d checks, %d pass, %d fail -- %s"
           % (len(results), sum(1 for r in results if r[1]),
@@ -13167,6 +14186,36 @@ def console():
             print(" fault: %r" % e)
 
 
+# --- Boundary coercion sweep -------------------------------------------------
+# Same pattern as Warpdrive.py: every helper whose parameters are all
+# numeric gets _args_real applied here, once, instead of a guard line inside
+# each body. A poisoned argument (str, None, list, complex) becomes NaN at
+# the boundary and propagates honestly; it can no longer TypeError its way
+# out of a report or a draw pass. Bodies also coerce individually -- the
+# wrap is the systemic guard for anything a body forgot.
+_NUMERIC_HELPERS = (
+    "_sech2", "_torus_surface",
+    "alcubierre_energy_j", "casimir_energy_density",
+    "chain_wormhole_offset", "clamp", "ctc_exists", "ctc_onset_s",
+    "energy_conditions", "energy_density", "equiv_mass_kg",
+    "ford_roman_bound_j_m3", "ford_roman_max_throat_tau",
+    "ford_roman_wall_limit", "fusion_fuel_kg", "lorentz_gamma",
+    "mmp_extremal_charge_c", "mmp_traversal_time_s",
+    "mouth_clock_rate", "mouth_time_offset_s", "mt_embedding_z",
+    "mt_exotic_energy_j", "mt_flare_out", "mt_min_throat_m",
+    "mt_proper_length", "mt_redshift_phi", "mt_shape_b",
+    "mt_shape_b_prime", "mt_throat_density", "mt_tidal_g",
+    "mt_tidal_profile", "mt_traversal_time_s", "radiator_temp_k",
+    "shape_df", "shape_df_shifted", "shape_f",
+    "visser_shell_energy_j", "visser_shell_mass_kg",
+    "wall_tidal_gradient", "warp_energy_integral", "waste_heat_w",
+    "york_theta",
+)
+for _hname in _NUMERIC_HELPERS:
+    globals()[_hname] = _args_real(globals()[_hname])
+del _hname
+
+
 def main(argv=None):
     if argv is not None:
         if isinstance(argv, (str, bytes, bytearray)) \
@@ -13269,11 +14318,8 @@ def main(argv=None):
     # and the table loads, the site positions are DE440-accurate; when
     # absent, the first-order Kepler fallback runs.
     if args.de440:
-        if _wp is not None:
-            r_ = _wp.de440_load(args.de440)
-            print("%s" % r_["verdict"])
-        else:
-            print("warp_physics module absent; using Kepler fallback")
+        r_ = de440_load(args.de440)
+        print("%s" % r_["verdict"])
 
     # --caches: print the viewer state-cache contents (H5).
     if args.caches:

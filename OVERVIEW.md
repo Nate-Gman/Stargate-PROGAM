@@ -8,9 +8,13 @@ weather, mesh relay), civil works (foundation, seismic, thermal expansion),
 chronology bookkeeping, and a fabrication manual that stops honestly where the
 physics runs out.
 
-One file — `stargate.py` (~13,400 lines) — contains the physics, the runtime
+One file — `stargate.py` (~14,500 lines) — contains the physics, the runtime
 model, the reports, and three front-ends: a pygame 3-D viewer (default), a
-tkinter 2-D fallback (`--window2d`), and a text console (`--console`).
+tkinter 2-D fallback (`--window2d`), and a text console (`--console`). It is a
+true monolith: every function it uses is defined inline (including the JPL
+DE440/SPK ephemeris reader), so it runs identically with or without
+`warp_physics.py` on the path — the module's only remaining role is the
+canonical reference the self-test's sync cross-check compares against.
 
 ## The honest verdict
 
@@ -72,6 +76,11 @@ The UI never blurs that line: build step 14 (throat formation) is marked
   drag decay, array-skin thermal swing +124 °C → 3 K.
 - J2000 civil epoch mapping (`pad_clock_epoch`), TT/TAI/GPS timescales
   (`pad_timescales`).
+- JPL DE440 upgrade path (`--de440 PATH`): an inline NAIF DAF/SPK reader
+  (Type 2/3 Chebyshev segments, barycenter-chained resolution, big- and
+  little-endian) swaps the first-order Kepler solve for the JPL tables —
+  ~2 km → ~m accuracy; absent or unreadable files keep the honest Kepler
+  fallback.
 
 ### The link (a real DSN worksheet, not a typed constant)
 - `antenna_gt_dbk` — G/T derived from the billed apertures:
@@ -194,10 +203,13 @@ typed for the story.
 
 ## Verification status — honest, not claimed
 
-- `python stargate.py --selftest` → **569 checks, all passing**
+- `python stargate.py --selftest` → **606 checks, all passing**
   (physics pins, hostile-input probes, ledger audits).
 - `python fuzz_test.py` → **11,832 hostile inputs, 0 crashes, 0 silent opens**
   — every malformed input returns a verdict, never opens the gate.
+- **Standalone**: the same self-test passes with `warp_physics.py` absent
+  (605 checks — only the sync cross-check itself skips); every function is
+  implemented inline.
 - `warp_physics.py` — the shared physics file is byte-identical with the
   Warpdrive.py copy and asserted so by both self-tests.
 - What "operational" means here: every modelled system returns truthful,
@@ -207,9 +219,11 @@ typed for the story.
 
 ## Files
 
-- `stargate.py` — physics, runtime model, reports, viewer (single file)
-- `warp_physics.py` — the shared physics module (byte-identical to the
-  Warpdrive copy; both self-tests assert it)
+- `stargate.py` — physics, runtime model, reports, viewer (single file,
+  no module deps beyond numpy/pygame for the 3-D front-end)
+- `warp_physics.py` — the canonical shared-physics reference (byte-identical
+  to the Warpdrive copy); stargate.py implements every function inline and
+  uses the module only for the self-test's sync cross-check
 - `OVERVIEW.md` — this document; `README.md` — quick reference
 - `PROJECTGOAL.md` — the objective; `PROJECTREF/` — the reference physics
 - `officialgoal.md` — the living spec: every round's changes, check counts,
