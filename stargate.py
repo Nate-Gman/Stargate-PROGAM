@@ -6418,7 +6418,10 @@ def _load_pygame():
             import pygame as _pg
         except ImportError:
             sys.meta_path.remove(blk)
-            import pygame as _pg          # safety: plain import
+            try:
+                import pygame as _pg      # safety: plain import
+            except ImportError:
+                _pg = None                # genuinely absent -> degrade
     finally:
         if blk in sys.meta_path:
             sys.meta_path.remove(blk)
@@ -13391,6 +13394,10 @@ def main(argv=None):
     if _load_pygame() is not None:
         render_window()
     else:
+        print("pygame is not installed in %s" % sys.executable)
+        print("  -> the 3-D twin needs it; falling back to the console.")
+        print("  -> run with the project venv, or: "
+              "python -m pip install pygame")
         console()
     return 0
 
